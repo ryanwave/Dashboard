@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DocHub · Engineering Documents</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23155eef'/%3E%3Cpath d='M9 8h9l5 5v11a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2z' fill='white'/%3E%3Cpath d='M11 16h10M11 19.5h10M11 23h6' stroke='%23155eef' stroke-width='1.6'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/">
+    <span class="brand-mark"><svg viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="currentColor"/><path d="M9 8h9l5 5v11a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2z" fill="#fff"/><path d="M11 16h10M11 19.5h10M11 23h6" stroke="currentColor" stroke-width="1.6"/></svg></span>
+    <span class="brand-text"><b>DocHub</b><small>Engineering Documents</small></span>
+  </a>
+
+  <nav class="picker" aria-label="Document location">
+    <label class="pick"><span>Model</span><select id="selModel"></select></label>
+    <svg class="chev" viewBox="0 0 20 20"><path d="M7 4l6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <label class="pick"><span>Milestone</span><select id="selMilestone"></select></label>
+    <svg class="chev" viewBox="0 0 20 20"><path d="M7 4l6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <label class="pick"><span>Variant</span><select id="selVariant"></select></label>
+  </nav>
+
+  <div class="search">
+    <svg viewBox="0 0 20 20"><circle cx="9" cy="9" r="6" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M13.5 13.5L17 17" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    <input id="search" type="search" placeholder="Search documents…" autocomplete="off">
+    <kbd>Ctrl K</kbd>
+    <div id="searchResults" class="search-results" hidden></div>
+  </div>
+
+  <button id="userBtn" class="user-btn" title="Change your name"><span class="avatar" id="userAvatar">?</span><span id="userName">Sign in</span></button>
+</header>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main id="main" class="main"></main>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<div id="modalRoot"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
