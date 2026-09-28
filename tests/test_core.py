@@ -139,3 +139,47 @@ def test_api_roundtrip(root):
     assert load_workbook(io.BytesIO(r.data))["Data"]["A1"].value == "Draft"
     assert c.get("/api/stats").get_json()["revisions"] == 1
     assert c.get("/api/document?path=../x.xlsx").status_code == 403
+
+
+def _sheet_xml(cells_xml):
+    return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="{excel_writer.NS}">'
+            f'<sheetData>{cells_xml}</sheetData></worksheet>').encode()
+
+
+def test_shared_formula_master_edit_expands_group():
+    xml = _sheet_xml('<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="shared" ref="B1:B3" si="0">A1*2</f><v>2</v></c></row>'
+                     '<row r="2"><c r="A2"><v>2</v></c><c r="B2"><f t="shared" si="0"/><v>4</v></c></row>'
+                     '<row r="3"><c r="A3"><v>3</v></c><c r="B3"><f t="shared" si="0"/><v>6</v></c></row>')
+    out = excel_writer._patch_sheet(xml, {(1, 2): 99}).decode()
+    assert "<f>A2*2</f>" in out and "<f>A3*2</f>" in out and 'si="0"' not in out
+
+
+def test_array_formula_member_edit_rejected():
+    xml = _sheet_xml('<row r="1"><c r="A1"><f t="array" ref="A1:A2">B1:B2*2</f><v>1</v></c></row>'
+                     '<row r="2"><c r="A2"><v>2</v></c></row>')
+    with pytest.raises(excel_writer.EditError):
+        excel_writer._patch_sheet(xml, {(2, 1): 5})
+
+
+def test_api_legacy_and_encrypted_files_explain_themselves(root):
+    v = root / "M/MS/V"
+    (v / "Old.xls").write_bytes(bytes.fromhex("d0cf11e0a1b11ae1") + bytes(504))
+    (v / "Secret.xlsx").write_bytes(bytes.fromhex("d0cf11e0a1b11ae1") + "EncryptedPackage".encode("utf-16-le") + bytes(64))
+    c = create_app(str(root)).test_client()
+    docs = c.get("/api/tree").get_json()["models"][0]["milestones"][0]["variants"][0]["documents"]
+    assert {d["file"]: d["supported"] for d in docs} == {"Doc.xlsx": True, "Old.xls": False, "Secret.xlsx": True}
+    r = c.get("/api/document?path=M/MS/V/Old.xls")
+    assert r.status_code == 422 and r.get_json()["code"] == "legacy"
+    r = c.get("/api/document?path=M/MS/V/Secret.xlsx")
+    assert r.status_code == 422 and r.get_json()["code"] == "encrypted"
+
+
+def test_documents_in_subfolders_and_milestones(root):
+    (root / "M/MS/V/Sub").mkdir()
+    make_book(root / "M/MS/V/Sub/Deep.xlsx")
+    make_book(root / "M/MS/Loose.xlsx")
+    t = create_app(str(root)).test_client().get("/api/tree").get_json()
+    ms = t["models"][0]["milestones"][0]
+    assert [d["name"] for d in ms["documents"]] == ["Loose"]
+    deep = [d for d in ms["variants"][0]["documents"] if d["name"] == "Deep"][0]
+    assert deep["folder"] == "Sub" and deep["path"] == "M/MS/V/Sub/Deep.xlsx"

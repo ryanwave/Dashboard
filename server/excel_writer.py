@@ -13,7 +13,8 @@ import re
 import zipfile
 
 from lxml import etree
-from openpyxl.utils import get_column_letter
+from openpyxl.formula.translate import Translator
+from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.utils.datetime import to_excel
 
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -27,8 +28,13 @@ def q(tag: str) -> str:
     return f"{{{NS}}}{tag}"
 
 
+_PARSER = etree.XMLParser(resolve_entities=False, huge_tree=True, remove_blank_text=False)
 _ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _REF = re.compile(r"([A-Z]+)(\d+)")
+
+
+class EditError(ValueError):
+    pass
 
 
 class Formula(str):
@@ -96,11 +102,15 @@ def coerce(text, original, number_format: str | None):
 # Package helpers
 # --------------------------------------------------------------------------
 def _sheet_paths(zf: zipfile.ZipFile) -> dict:
-    wb = etree.fromstring(zf.read("xl/workbook.xml"))
-    rels = etree.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+    wb = etree.fromstring(zf.read("xl/workbook.xml"), parser=_PARSER)
+    rels = etree.fromstring(zf.read("xl/_rels/workbook.xml.rels"), parser=_PARSER)
     targets = {r.get("Id"): r.get("Target") for r in rels}
     out = {}
-    for sh in wb.find(q("sheets")):
+    sheets = wb.find(q("sheets"))
+    if sheets is None:
+        raise EditError("This workbook uses the 'Strict Open XML' format. Open it in Excel and "
+                        "Save As → Excel Workbook (*.xlsx), then edit it here.")
+    for sh in sheets:
         rid = sh.get(f"{{{REL_NS}}}id")
         target = targets.get(rid)
         if not target:
@@ -140,10 +150,60 @@ def _set_value(c, value):
         c.append(e)
 
 
+def _in_ref(ref: str, r: int, c: int) -> bool:
+    try:
+        min_c, min_r, max_c, max_r = range_boundaries(ref)
+    except Exception:
+        return False
+    return min_r <= r <= max_r and min_c <= c <= max_c
+
+
+def _prepare_formulas(sheet_data, edits: dict):
+    """Keep shared / array formulas valid when edited cells take part in them.
+
+    Excel stores a column of similar formulas as one "shared" formula whose text
+    lives only in the first (master) cell. If that master cell is overwritten,
+    every other cell of the group is rewritten with its own explicit formula.
+    """
+    groups, masters = {}, {}
+    for c in sheet_data.iter(q("c")):
+        f = c.find(q("f"))
+        if f is None:
+            continue
+        ref = c.get("r")
+        m = _REF.match(ref or "")
+        if not m:
+            continue
+        rc = (int(m.group(2)), col_index(m.group(1)))
+        if f.get("t") == "shared" and f.get("si") is not None:
+            groups.setdefault(f.get("si"), []).append((rc, c, f))
+            if f.text:
+                masters[f.get("si")] = (rc, ref, f.text)
+        elif f.get("t") == "array" and f.get("ref"):
+            for (r, cc) in edits:
+                if (r, cc) != rc and _in_ref(f.get("ref"), r, cc):
+                    raise EditError(f"Cell {get_column_letter(cc)}{r} is part of an array formula "
+                                    f"({f.get('ref')}) and can only be changed in Excel.")
+    for si, (mrc, mref, text) in masters.items():
+        if mrc not in edits:
+            continue
+        for rc, c, f in groups.get(si, []):
+            if rc == mrc or rc in edits:
+                continue
+            try:
+                new = Translator("=" + text, origin=mref).translate_formula(c.get("r"))[1:]
+            except Exception:
+                new = text
+            for attr in ("t", "si", "ref"):
+                f.attrib.pop(attr, None)
+            f.text = new
+
+
 def _patch_sheet(xml: bytes, edits: dict) -> bytes:
     """edits: {(row, col): value}"""
-    root = etree.fromstring(xml)
+    root = etree.fromstring(xml, parser=_PARSER)
     sheet_data = root.find(q("sheetData"))
+    _prepare_formulas(sheet_data, edits)
     col_styles = {}
     cols = root.find(q("cols"))
     if cols is not None:
@@ -214,7 +274,7 @@ _CALC_AFTER = ["oleSize", "customWorkbookViews", "pivotCaches", "smartTagPr", "s
 
 
 def _patch_workbook(xml: bytes) -> bytes:
-    root = etree.fromstring(xml)
+    root = etree.fromstring(xml, parser=_PARSER)
     calc = root.find(q("calcPr"))
     if calc is None:
         calc = etree.Element(q("calcPr"))

@@ -94,11 +94,27 @@ python -m pytest -q
 | History & audit | `server/storage.py` | JSON revision log + full snapshot per revision under `.dochub/` |
 | Front end | `static/` | Plain HTML/CSS/JS with no build step and no internet/CDN needed |
 
+### Troubleshooting: a document does not open
+
+1. Double-click **`check.bat`**. It tries to open every workbook under `C:\Dashboard` and
+   writes a report to `dochub-check.txt`, with one line per file (OK, or the reason it fails).
+2. The web page also explains the problem and offers a fix when a file cannot be opened:
+
+| Message | What to do |
+|---|---|
+| **Old Excel format** (.xls / .xlsb) | Click **Convert to .xlsx**. This needs Excel on the server PC (plus `pip install pywin32`) or LibreOffice. Otherwise, open the file in Excel and use Save As → *Excel Workbook (.xlsx)*. The original file is kept. |
+| **This workbook is protected** | The file is encrypted by a password or a Microsoft sensitivity label such as "Confidential – encrypted". Save a copy without encryption, or ask IT for a label that does not encrypt. |
+| **The file is in use / could not be read** | Close it in Excel, or make the OneDrive folder "Always keep on this device". |
+
+Documents are found in Variant folders, including their sub-folders, and also
+directly inside Model or Milestone folders.
+
 ### Current limitations
 
 - There is no login yet. Users type their name, which is stored in the browser.
   Windows / Active Directory sign-in is the natural next step.
 - Formulas are shown with Excel's last calculated value. A cell that depends on an
   edited cell updates when the file is next opened in Excel.
-- Legacy `.xls` files must be saved as `.xlsx` first.
+- Legacy `.xls` files are listed and can be converted to `.xlsx` with one click (see above).
+- Cells inside an *array formula* (entered with Ctrl+Shift+Enter) can only be changed in Excel.
 - Very large sheets are shown up to 3,000 rows × 150 columns.

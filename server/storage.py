@@ -27,6 +27,8 @@ from openpyxl import load_workbook
 from . import excel_reader, excel_writer
 
 DOC_EXTS = (".xlsx", ".xlsm")
+LEGACY_EXTS = (".xls", ".xlsb")
+ALL_EXTS = DOC_EXTS + LEGACY_EXTS
 STATUSES = ["Draft", "In Review", "Approved", "Released"]
 META_DIR = ".dochub"
 
@@ -41,6 +43,49 @@ class Conflict(Exception):
 
 class FileLocked(Exception):
     pass
+
+
+class DocError(Exception):
+    """A document that cannot be opened, with a user-facing explanation."""
+
+    def __init__(self, code: str, message: str, hint: str = ""):
+        super().__init__(message)
+        self.code, self.message, self.hint = code, message, hint
+
+
+OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def check_readable(f: Path):
+    """Raise DocError with a clear explanation when *f* is not a readable .xlsx."""
+    try:
+        with open(f, "rb") as fh:
+            head = fh.read(8)
+            blob = head + fh.read(4 << 20) if head == OLE_MAGIC else head
+    except PermissionError:
+        raise DocError("locked", "The file could not be read — it is locked by another program.",
+                       "Close it in Excel (or wait for OneDrive to finish syncing) and try again.")
+    except OSError as exc:
+        raise DocError("unreadable", f"The file could not be read: {exc}",
+                       "If it lives in OneDrive, make sure it is available offline (right-click → Always keep on this device).")
+    suffix = f.suffix.lower()
+    if head == OLE_MAGIC:
+        if "EncryptedPackage".encode("utf-16-le") in blob:
+            raise DocError("encrypted", "This workbook is encrypted — it is protected by a password or a "
+                           "Microsoft sensitivity label (e.g. 'Confidential' with encryption).",
+                           "Open it in Excel, remove the password / change the label to one without encryption, "
+                           "save, and open it here again.")
+        raise DocError("legacy", "This is an old-format Excel 97-2003 (.xls) workbook.",
+                       "Use 'Convert to .xlsx' below, or open it in Excel and Save As → Excel Workbook (*.xlsx).")
+    if suffix == ".xlsb":
+        raise DocError("legacy", "This is an Excel Binary (.xlsb) workbook, which cannot be edited on the web.",
+                       "Use 'Convert to .xlsx' below, or open it in Excel and Save As → Excel Workbook (*.xlsx).")
+    if head[:2] != b"PK":
+        raise DocError("corrupt", "This file is not a valid Excel workbook (it may be damaged or still downloading).",
+                       "Open it in Excel to check it, then save it again.")
+    if suffix == ".xls":
+        raise DocError("legacy", "This file has an .xls extension.",
+                       "Rename or Save As .xlsx in Excel, then open it here.")
 
 
 def now_iso() -> str:
@@ -61,7 +106,9 @@ def _visible(name: str) -> bool:
 
 class Store:
     def __init__(self, root: str):
-        self.root = Path(root).resolve()
+        # abspath (not resolve) so junctions / OneDrive folders / mapped drives
+        # inside the root are treated as part of it.
+        self.root = Path(os.path.abspath(root))
         self.root.mkdir(parents=True, exist_ok=True)
         self.meta_root = self.root / META_DIR
         (self.meta_root / "docs").mkdir(parents=True, exist_ok=True)
@@ -69,47 +116,75 @@ class Store:
     # ------------------------------------------------------------------ paths
     def resolve(self, rel: str) -> Path:
         rel = (rel or "").replace("\\", "/").strip("/")
-        p = (self.root / rel).resolve()
-        if p != self.root and self.root not in p.parents:
+        parts = [x for x in rel.split("/") if x not in ("", ".")]
+        if any(x == ".." or ":" in x for x in parts):
             raise PermissionError("Path escapes the document root")
-        if any(part.startswith(".") for part in Path(rel).parts):
+        if any(x.startswith(".") for x in parts):
             raise PermissionError("Hidden paths are not accessible")
-        return p
+        return self.root.joinpath(*parts) if parts else self.root
 
     def rel(self, p: Path) -> str:
-        return p.resolve().relative_to(self.root).as_posix()
+        return Path(os.path.abspath(p)).relative_to(self.root).as_posix()
+
+    def _doc_dir_path(self, rel: str) -> Path:
+        # Short, fixed-length folder per document: avoids the 260-character
+        # Windows path limit with long file / folder names.
+        key = hashlib.sha1(rel.encode("utf-8")).hexdigest()[:20]
+        return self.meta_root / "docs" / key
 
     def doc_dir(self, rel: str) -> Path:
-        d = self.meta_root / "docs" / rel
-        d.mkdir(parents=True, exist_ok=True)
+        d = self._doc_dir_path(rel)
+        if not d.exists():
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "path.txt").write_text(rel, encoding="utf-8")
         return d
 
     # ------------------------------------------------------------------- tree
     def _subdirs(self, p: Path):
         try:
-            return sorted((d for d in p.iterdir() if d.is_dir() and _visible(d.name)), key=lambda d: d.name.lower())
+            return sorted((d for d in p.iterdir() if _visible(d.name) and d.is_dir()), key=lambda d: d.name.lower())
         except OSError:
             return []
 
-    def _docs(self, p: Path):
+    def _docs(self, p: Path, recursive=False, _depth=0):
+        """Excel files in *p* (and, for variants, its sub-folders)."""
+        out = []
         try:
-            return sorted((f for f in p.iterdir() if f.is_file() and _visible(f.name)
-                           and f.suffix.lower() in DOC_EXTS), key=lambda f: f.name.lower())
+            entries = sorted(p.iterdir(), key=lambda e: e.name.lower())
         except OSError:
-            return []
+            return out
+        for e in entries:
+            if not _visible(e.name):
+                continue
+            try:
+                if e.is_file() and e.suffix.lower() in ALL_EXTS:
+                    out.append(e)
+                elif recursive and _depth < 6 and e.is_dir():
+                    out.extend(self._docs(e, True, _depth + 1))
+            except OSError:
+                continue
+        return out
 
-    def doc_summary(self, f: Path) -> dict:
+    def doc_summary(self, f: Path, base: Path) -> dict:
         rel = self.rel(f)
-        st = f.stat()
+        try:
+            st = f.stat()
+            size, mtime = st.st_size, st.st_mtime
+        except OSError:
+            size, mtime = 0, 0
         revs = self._read_revisions(rel)
         last = revs[-1] if revs else None
         meta = self._read_meta(rel)
+        sub = f.parent.relative_to(base).as_posix() if f.parent != base else ""
         return {
             "name": f.stem,
             "file": f.name,
+            "folder": "" if sub == "." else sub,
             "path": rel,
-            "size": st.st_size,
-            "modified": dt.datetime.fromtimestamp(st.st_mtime).astimezone().isoformat(timespec="seconds"),
+            "format": f.suffix.lower().lstrip("."),
+            "supported": f.suffix.lower() in DOC_EXTS,
+            "size": size,
+            "modified": dt.datetime.fromtimestamp(mtime).astimezone().isoformat(timespec="seconds"),
             "rev": last["rev"] if last else 0,
             "revisions": len(revs),
             "lastUser": last["user"] if last else None,
@@ -124,17 +199,24 @@ class Store:
             for ms in self._subdirs(m):
                 variants = []
                 for v in self._subdirs(ms):
-                    variants.append({"name": v.name, "documents": [self.doc_summary(f) for f in self._docs(v)]})
-                milestones.append({"name": ms.name, "variants": variants})
-            models.append({"name": m.name, "milestones": milestones})
-        return {"root": str(self.root), "models": models, "statuses": STATUSES}
+                    variants.append({"name": v.name,
+                                     "documents": [self.doc_summary(f, v) for f in self._docs(v, recursive=True)]})
+                milestones.append({"name": ms.name, "variants": variants,
+                                   "documents": [self.doc_summary(f, ms) for f in self._docs(ms)]})
+            models.append({"name": m.name, "milestones": milestones,
+                           "documents": [self.doc_summary(f, m) for f in self._docs(m)]})
+        return {"root": str(self.root), "models": models, "statuses": STATUSES,
+                "rootDocuments": [self.doc_summary(f, self.root) for f in self._docs(self.root)]}
 
-    def all_docs(self):
+    def all_docs(self, supported_only=True):
+        found = list(self._docs(self.root))
         for m in self._subdirs(self.root):
+            found += self._docs(m)
             for ms in self._subdirs(m):
+                found += self._docs(ms)
                 for v in self._subdirs(ms):
-                    for f in self._docs(v):
-                        yield f
+                    found += self._docs(v, recursive=True)
+        return [f for f in found if not supported_only or f.suffix.lower() in DOC_EXTS]
 
     # --------------------------------------------------------------- metadata
     def _read_json(self, p: Path, default):
@@ -152,10 +234,10 @@ class Store:
         os.replace(tmp, p)
 
     def _read_revisions(self, rel: str) -> list:
-        return self._read_json(self.meta_root / "docs" / rel / "revisions.json", [])
+        return self._read_json(self._doc_dir_path(rel) / "revisions.json", [])
 
     def _read_meta(self, rel: str) -> dict:
-        return self._read_json(self.meta_root / "docs" / rel / "meta.json", {})
+        return self._read_json(self._doc_dir_path(rel) / "meta.json", {})
 
     def log_activity(self, entry: dict):
         with open(self.meta_root / "activity.jsonl", "a", encoding="utf-8") as fh:
@@ -238,10 +320,20 @@ class Store:
 
     # ----------------------------------------------------------------- reading
     def load(self, rel: str, rev: int | None = None) -> dict:
+        live = self.resolve(rel)
+        if not live.is_file():
+            raise FileNotFoundError(rel)
+        check_readable(live)
         revs = self.sync(rel)
-        f = self.resolve(rel) if rev is None else self.revision_file(rel, rev)
+        f = live if rev is None else self.revision_file(rel, rev)
         st = f.stat()
-        model = excel_reader.read_workbook(str(f), cache_key=(str(f), st.st_mtime, st.st_size))
+        try:
+            model = excel_reader.read_workbook(str(f), cache_key=(str(f), st.st_mtime, st.st_size))
+        except DocError:
+            raise
+        except Exception as exc:
+            raise DocError("parse", f"The workbook could not be read ({type(exc).__name__}: {exc}).",
+                           "Please send this message to the DocHub maintainer together with the file name.") from exc
         latest = revs[-1]
         meta = self._read_meta(rel)
         return {
@@ -272,6 +364,8 @@ class Store:
                     if r < 1 or c < 1:
                         continue
                     cell = ws._cells.get((r, c))
+                    if cell is not None and cell.__class__.__name__ == "MergedCell":
+                        continue  # hidden part of a merged range — Excel ignores it too
                     orig = cell.value if cell is not None else None
                     fmt = cell.number_format if cell is not None else "General"
                     old_text = excel_reader.edit_text(orig, fmt)
@@ -363,6 +457,22 @@ class Store:
         self.log_activity({"time": now_iso(), "user": user or "Unknown", "path": rel, "action": "status",
                            "note": f"{old} → {status}"})
 
+    # ------------------------------------------------------- legacy formats
+    def convert_legacy(self, rel: str, user: str) -> str:
+        """Create an .xlsx copy of an .xls/.xlsb file next to it (original kept)."""
+        src = self.resolve(rel)
+        if not src.is_file():
+            raise FileNotFoundError(rel)
+        target = src.with_suffix(".xlsx")
+        if target.exists():
+            raise FileExistsError(f"'{target.name}' already exists in this folder — open that file instead.")
+        convert_with_excel_or_libreoffice(src, target)
+        new_rel = self.rel(target)
+        self.log_activity({"time": now_iso(), "user": user or "Unknown", "path": new_rel, "action": "upload",
+                           "note": f"Converted from {src.name}"})
+        self.sync(new_rel)
+        return new_rel
+
     # --------------------------------------------------------------- folders
     def make_folder(self, parent: str, name: str, user: str) -> str:
         name = (name or "").strip()
@@ -417,3 +527,54 @@ def diff_files(old: Path, new: Path) -> list:
                 out.append({"sheet": sheet, "cell": f"{excel_reader.get_column_letter(c)}{r}", "r": r, "c": c,
                             "old": va.get(key, ""), "new": vb.get(key, "")})
     return out
+
+
+def convert_with_excel_or_libreoffice(src: Path, target: Path):
+    """Use Microsoft Excel (via COM, Windows) or LibreOffice to save *src* as .xlsx."""
+    errors = []
+    try:
+        import pythoncom  # type: ignore
+        import win32com.client  # type: ignore
+    except ImportError:
+        errors.append("Microsoft Excel automation is not available (pywin32 is not installed).")
+    else:
+        pythoncom.CoInitialize()
+        excel = None
+        try:
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            wb = excel.Workbooks.Open(str(src), UpdateLinks=0, ReadOnly=True)
+            try:
+                wb.SaveAs(str(target), FileFormat=51)  # 51 = xlOpenXMLWorkbook (.xlsx)
+            finally:
+                wb.Close(SaveChanges=False)
+            return
+        except Exception as exc:
+            errors.append(f"Excel could not convert the file: {exc}")
+        finally:
+            if excel is not None:
+                try:
+                    excel.Quit()
+                except Exception:
+                    pass
+            pythoncom.CoUninitialize()
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    for cand in (r"C:\Program Files\LibreOffice\program\soffice.exe",
+                 r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"):
+        if not soffice and os.path.exists(cand):
+            soffice = cand
+    if soffice:
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            res = subprocess.run([soffice, "--headless", "--convert-to", "xlsx", "--outdir", tmp, str(src)],
+                                 capture_output=True, timeout=180)
+            out = Path(tmp) / (src.stem + ".xlsx")
+            if out.exists():
+                shutil.move(str(out), target)
+                return
+            errors.append("LibreOffice could not convert the file: " + res.stderr.decode(errors="ignore")[:200])
+    else:
+        errors.append("LibreOffice is not installed.")
+    raise DocError("convert", "Automatic conversion is not available on this server.",
+                   "Open the file in Excel and use Save As → Excel Workbook (*.xlsx). Details: " + " ".join(errors))

@@ -13,16 +13,19 @@ import datetime as dt
 import html
 import re
 import threading
+import zipfile
 from collections import OrderedDict
 
 from lxml import etree
 from openpyxl import load_workbook
 from openpyxl.cell.rich_text import CellRichText, TextBlock
 from openpyxl.styles.colors import COLOR_INDEX
+from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils import get_column_letter, range_boundaries
+from openpyxl.utils.datetime import from_excel
 
-MAX_ROWS = 3000
-MAX_COLS = 150
+MAX_ROWS = 2500
+MAX_COLS = 120
 DEFAULT_COL_WIDTH = 8.43  # Excel characters
 DEFAULT_ROW_HEIGHT = 15.0  # points
 
@@ -378,25 +381,34 @@ def row_height_px(points: float) -> int:
 
 
 def _used_range(ws):
-    max_r = max_c = 0
+    """Rows/cols that actually matter: values, merges and images, plus any
+    formatted-only cells close to them (whole-column formatting that runs
+    thousands of rows past the data is ignored)."""
+    val_r = val_c = 0
+    sty_r = sty_c = 0
     for (r, c), cell in ws._cells.items():
-        interesting = cell.value is not None
-        if not interesting and cell.has_style:
+        if cell.value is not None:
+            if r > val_r:
+                val_r = r
+            if c > val_c:
+                val_c = c
+        elif cell.has_style and (r > sty_r or c > sty_c):
             fill = cell.fill
             b = cell.border
-            interesting = (fill is not None and fill.fill_type not in (None, "none")) or any(
-                getattr(getattr(b, s, None), "style", None) for s in ("left", "right", "top", "bottom"))
-        if interesting:
-            max_r, max_c = max(max_r, r), max(max_c, c)
+            if (fill is not None and fill.fill_type not in (None, "none")) or any(
+                    getattr(getattr(b, s, None), "style", None) for s in ("left", "right", "top", "bottom")):
+                sty_r, sty_c = max(sty_r, r), max(sty_c, c)
     for mr in ws.merged_cells.ranges:
-        max_r, max_c = max(max_r, mr.max_row), max(max_c, mr.max_col)
+        val_r, val_c = max(val_r, mr.max_row), max(val_c, mr.max_col)
     for img in getattr(ws, "_images", []):
         try:
             anc = img.anchor
             to = getattr(anc, "to", None) or anc._from
-            max_r, max_c = max(max_r, to.row + 1), max(max_c, to.col + 1)
+            val_r, val_c = max(val_r, to.row + 1), max(val_c, to.col + 1)
         except Exception:
             pass
+    max_r = max(val_r, min(sty_r, val_r + 40))
+    max_c = max(val_c, min(sty_c, val_c + 10))
     return max(1, max_r), max(1, max_c)
 
 
@@ -466,7 +478,7 @@ def _images(ws) -> list:
     return imgs
 
 
-def sheet_model(ws, ws_formulas, wb, theme) -> dict:
+def sheet_model(ws, cached, wb, theme) -> dict:
     max_r, max_c = _used_range(ws)
     truncated = max_r > MAX_ROWS or max_c > MAX_COLS
     max_r, max_c = min(max_r, MAX_ROWS), min(max_c, MAX_COLS)
@@ -554,13 +566,25 @@ def sheet_model(ws, ws_formulas, wb, theme) -> dict:
                 css["border-top"] = side(r, c, "top")
 
             value = cell.value if cell is not None else None
-            number_format = cell.number_format if cell is not None else "General"
+            number_format = (cell.number_format if cell is not None else None) or "General"
             entry = {}
+            formula = _formula_text(value)
+            if formula is not None:
+                entry["f"] = formula
+                value = cached.get((r, c))
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and is_date_format(number_format):
+                    try:
+                        value = from_excel(value)
+                    except Exception:
+                        pass
             if value is not None:
-                entry["v"] = display_value(value, number_format)
-                entry["e"] = edit_text(value, number_format)
-                if isinstance(value, CellRichText):
-                    entry["h"] = rich_html(value, theme)
+                try:
+                    entry["v"] = display_value(value, number_format)
+                    entry["e"] = edit_text(value, number_format)
+                    if isinstance(value, CellRichText):
+                        entry["h"] = rich_html(value, theme)
+                except Exception:
+                    entry["v"] = entry["e"] = str(value)
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     entry["n"] = 1
                     if "text-align" not in css:
@@ -571,9 +595,6 @@ def sheet_model(ws, ws_formulas, wb, theme) -> dict:
                         css["text-align"] = "right"
                 elif isinstance(value, bool) and "text-align" not in css:
                     css["text-align"] = "center"
-            fcell = ws_formulas._cells.get((r, c)) if ws_formulas is not None else None
-            if fcell is not None and isinstance(fcell.value, str) and fcell.value.startswith("="):
-                entry["f"] = fcell.value
             if cell is not None and cell.comment is not None:
                 entry["note"] = cell.comment.text
             if meta["wrap"]:
@@ -621,6 +642,57 @@ def sheet_model(ws, ws_formulas, wb, theme) -> dict:
     }
 
 
+def _formula_text(value):
+    if isinstance(value, str):
+        return value if value.startswith("=") and len(value) > 1 else None
+    text = getattr(value, "text", None)  # ArrayFormula / DataTableFormula
+    if isinstance(text, str):
+        return text if text.startswith("=") else "=" + text
+    if value.__class__.__name__ == "DataTableFormula":
+        return "=TABLE()"
+    return None
+
+
+_SML = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_REF = re.compile(r"([A-Z]+)(\d+)")
+
+
+def formula_cache(path: str) -> dict:
+    """{sheet: {(row, col): cached value}} for every formula cell."""
+    from openpyxl.utils import column_index_from_string
+    from .excel_writer import _sheet_paths
+
+    out = {}
+    with zipfile.ZipFile(path) as z:
+        names = set(z.namelist())
+        for sheet, part in _sheet_paths(z).items():
+            if part not in names:
+                continue
+            vals = {}
+            with z.open(part) as fh:
+                for _, el in etree.iterparse(fh, tag=f"{_SML}c", resolve_entities=False, huge_tree=True):
+                    if el.find(f"{_SML}f") is not None:
+                        v = el.find(f"{_SML}v")
+                        m = _REF.match(el.get("r") or "")
+                        if v is not None and v.text is not None and m:
+                            t = el.get("t")
+                            if t == "b":
+                                val = v.text == "1"
+                            elif t in ("str", "e", "inlineStr", "s"):
+                                val = v.text
+                            else:
+                                try:
+                                    val = float(v.text)
+                                    if val.is_integer() and abs(val) < 1e15:
+                                        val = int(val)
+                                except ValueError:
+                                    val = v.text
+                            vals[(int(m.group(2)), column_index_from_string(m.group(1)))] = val
+                    el.clear()
+            out[sheet] = vals
+    return out
+
+
 _cache: "OrderedDict[tuple, dict]" = OrderedDict()
 _cache_lock = threading.Lock()
 
@@ -632,16 +704,17 @@ def read_workbook(path: str, cache_key=None) -> dict:
             if cache_key in _cache:
                 _cache.move_to_end(cache_key)
                 return _cache[cache_key]
-    wb = load_workbook(path, data_only=True, rich_text=True)
+    # One parse of the workbook (styles + formulas); the results Excel last
+    # calculated for formula cells are read straight from the sheet XML.
+    wb = load_workbook(path, data_only=False, rich_text=True)
     try:
-        wb_f = load_workbook(path, data_only=False)
+        cache = formula_cache(path)
     except Exception:
-        wb_f = None
+        cache = {}
     theme = parse_theme(getattr(wb, "loaded_theme", None))
     sheets = []
     for ws in wb.worksheets:
-        ws_f = wb_f[ws.title] if wb_f is not None and ws.title in wb_f.sheetnames else None
-        sheets.append(sheet_model(ws, ws_f, wb, theme))
+        sheets.append(sheet_model(ws, cache.get(ws.title, {}), wb, theme))
     active = wb.active.title if wb.active is not None else (sheets[0]["name"] if sheets else None)
     model = {"sheets": sheets, "active": active}
     if cache_key is not None:

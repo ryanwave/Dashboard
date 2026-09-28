@@ -159,11 +159,18 @@ const S = {
 };
 
 function allDocs() {
-  const out = [];
-  for (const m of S.tree?.models || []) for (const ms of m.milestones) for (const v of ms.variants)
-    for (const d of v.documents) out.push({ ...d, model: m.name, milestone: ms.name, variant: v.name });
+  const out = (S.tree?.rootDocuments || []).map((d) => ({ ...d, model: "", milestone: "", variant: "" }));
+  for (const m of S.tree?.models || []) {
+    for (const d of m.documents || []) out.push({ ...d, model: m.name, milestone: "", variant: "" });
+    for (const ms of m.milestones) {
+      for (const d of ms.documents || []) out.push({ ...d, model: m.name, milestone: ms.name, variant: "" });
+      for (const v of ms.variants) for (const d of v.documents) out.push({ ...d, model: m.name, milestone: ms.name, variant: v.name });
+    }
+  }
   return out;
 }
+const xlIcon = (d, lg) => `<span class="xl-icon${lg ? " lg" : ""}${d && d.supported === false ? " legacy" : ""}" title="${d ? esc(d.file) : ""}">${d && d.supported === false ? d.format.toUpperCase() : "X"}</span>`;
+const docWhere = (d) => [d.model, d.milestone, d.variant, d.folder].filter(Boolean).join(" › ") || "Top folder";
 function findNode(model, milestone, variant) {
   const m = S.tree?.models.find((x) => x.name === model);
   const ms = m?.milestones.find((x) => x.name === milestone);
@@ -235,10 +242,10 @@ function bindSearch() {
     const q = input.value.trim().toLowerCase();
     if (!q) { box.hidden = true; return; }
     const terms = q.split(/\s+/);
-    results = allDocs().filter((d) => terms.every((t) => `${d.name} ${d.model} ${d.milestone} ${d.variant}`.toLowerCase().includes(t))).slice(0, 12);
+    results = allDocs().filter((d) => terms.every((t) => `${d.name} ${d.model} ${d.milestone} ${d.variant} ${d.folder || ""}`.toLowerCase().includes(t))).slice(0, 12);
     active = Math.min(active, Math.max(0, results.length - 1));
     box.innerHTML = results.length
-      ? results.map((d, i) => `<div class="sr ${i === active ? "active" : ""}" data-i="${i}"><span class="xl-icon">X</span><div><div>${esc(d.name)}</div><small>${esc(d.model)} › ${esc(d.milestone)} › ${esc(d.variant)}</small></div></div>`).join("")
+      ? results.map((d, i) => `<div class="sr ${i === active ? "active" : ""}" data-i="${i}">${xlIcon(d)}<div><div>${esc(d.name)}</div><small>${esc(docWhere(d))}</small></div></div>`).join("")
       : `<div class="empty">No documents match “${esc(input.value)}”</div>`;
     box.hidden = false;
   };
@@ -280,8 +287,10 @@ async function route() {
   }
   closeFloating();
   if (r.view === "doc") {
-    const segs = r.path.split("/");
-    S.sel = { model: segs[0] || "", milestone: segs[1] || "", variant: segs[2] || "" };
+    const d = allDocs().find((x) => x.path === r.path);
+    const segs = r.path.split("/").slice(0, -1);
+    S.sel = d ? { model: d.model, milestone: d.milestone, variant: d.variant }
+      : { model: segs[0] || "", milestone: segs[1] || "", variant: segs[2] || "" };
     paintPicker();
     renderSidebar(r.path);
     await showEditor(r.path, r.rev);
@@ -310,9 +319,7 @@ function renderSidebar(activePath) {
     html += `<div class="side-section"><div class="side-title"><span>Documents</span><span>${v.documents.length}</span></div>
       <div class="tree-ctx"><b>${esc(m.name)}</b> › ${esc(ms.name)} › <b>${esc(v.name)}</b></div>`;
     html += v.documents.length
-      ? v.documents.map((d) => `<div class="doc-link ${d.path === activePath ? "active" : ""}" data-path="${esc(d.path)}">
-          <span class="xl-icon">X</span><div style="min-width:0"><div class="t">${esc(d.name)}</div>
-          <small><span class="pill ${statusClass(d.status)}">${esc(d.status)}</span>Rev ${d.rev}</small></div></div>`).join("")
+      ? v.documents.map((d) => sideDoc(d, activePath)).join("")
       : `<div class="side-empty">No documents in this variant yet. Upload an Excel file to get started.</div>`;
     html += `</div>`;
   } else {
@@ -326,6 +333,8 @@ function renderSidebar(activePath) {
       return `<button class="nav-item" data-href="${folderHash([...base, x.name])}">${I.folder}<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(x.name)}</span><span class="count">${count}</span></button>`;
     }).join("") || `<div class="side-empty">Nothing here yet.</div>`;
     html += `</div>`;
+    const loose = ms ? ms.documents : m ? m.documents : S.tree?.rootDocuments;
+    if (loose && loose.length) html += `<div class="side-section"><div class="side-title"><span>Documents here</span><span>${loose.length}</span></div>${loose.map((d) => sideDoc(d, activePath)).join("")}</div>`;
   }
   html += `</div>`;
   const depth = [S.sel.model, S.sel.milestone, S.sel.variant].filter(Boolean).length;
@@ -340,11 +349,17 @@ function renderSidebar(activePath) {
   $("#sbUpload")?.addEventListener("click", () => uploadDialog());
   $("#sbNew")?.addEventListener("click", () => newFolderDialog());
 }
+function sideDoc(d, activePath) {
+  return `<div class="doc-link ${d.path === activePath ? "active" : ""}" data-path="${esc(d.path)}" title="${esc(d.file)}">
+    ${xlIcon(d)}<div style="min-width:0"><div class="t">${esc(d.name)}</div>
+    <small>${d.folder ? `<span class="subdir">${I.folder.replace("<svg", '<svg width="12" height="12"')}${esc(d.folder)}</span>` : ""}
+    ${d.supported === false ? `<span class="pill st-in-review nodot">.${esc(d.format)}</span>` : `<span class="pill ${statusClass(d.status)}">${esc(d.status)}</span>Rev ${d.rev}`}</small></div></div>`;
+}
 function countDocs(node) {
-  if (node.documents) return node.documents.length;
-  if (node.variants) return node.variants.reduce((a, v) => a + v.documents.length, 0);
-  if (node.milestones) return node.milestones.reduce((a, ms) => a + countDocs(ms), 0);
-  return 0;
+  let n = (node.documents || []).length;
+  if (node.variants) n += node.variants.reduce((a, v) => a + v.documents.length, 0);
+  if (node.milestones) n += node.milestones.reduce((a, ms) => a + countDocs(ms), 0);
+  return n;
 }
 
 // ---------------------------------------------------------------- home
@@ -390,8 +405,8 @@ async function renderHome() {
         <div class="card-body">${feed(st.activity.slice(0, 9))}</div></div>
       <div class="card"><div class="card-head"><h3>Recently updated documents</h3><span></span></div>
         <div class="card-body"><ul class="feed">${st.recentDocs.map((d) => `<li>
-          <span class="xl-icon">X</span>
-          <div class="ft"><a href="#/d/${enc(d.path)}">${esc(d.name)}</a><small>${esc(d.path.split("/").slice(0, 3).join(" › "))}</small></div>
+          ${xlIcon(d)}
+          <div class="ft"><a href="#/d/${enc(d.path)}">${esc(d.name)}</a><small>${esc(d.path.split("/").slice(0, -1).join(" › "))}</small></div>
           <span class="when"><span class="pill ${statusClass(d.status)}">${esc(d.status)}</span></span></li>`).join("") || "<li>No documents yet.</li>"}</ul></div></div>
     </div>
   </div>`;
@@ -491,14 +506,16 @@ function renderFolder(parts) {
         <div><h4>${esc(c.name)}</h4><div class="path">${childLabel} · ${sub}</div></div></div>
         <div class="meta">${chips || '<span style="color:var(--faint)">Empty</span>'}</div>
         <div class="foot"><span>${last ? "Updated " + timeAgo(last.modified) : "No documents yet"}</span>${I.chevRight.replace("<svg", '<svg width="16" height="16"')}</div></div>`;
-    }).join("") || `<div class="card empty-state" style="grid-column:1/-1"><div class="big">${I.folder}</div><h3>No ${childLabel.toLowerCase()}s yet</h3><p>Create one to start organising documents.</p></div>`}</div></div>`;
+    }).join("") || `<div class="card empty-state" style="grid-column:1/-1"><div class="big">${I.folder}</div><h3>No ${childLabel.toLowerCase()}s yet</h3><p>Create one to start organising documents.</p></div>`}</div>
+    ${(ms || m).documents?.length ? `<h3 style="margin:28px 0 12px;font-size:16px">Documents in this folder</h3><div class="doc-grid">${(ms || m).documents.map(docCard).join("")}</div>` : ""}</div>`;
   $("#fNew").addEventListener("click", () => newFolderDialog());
-  $$(".doc-card", main).forEach((el) => el.addEventListener("click", () => (location.hash = el.dataset.href)));
+  $$(".doc-card[data-path]", main).forEach((el) => el.addEventListener("click", () => openDoc(el.dataset.path)));
+  $$(".doc-card[data-href]", main).forEach((el) => el.addEventListener("click", () => (location.hash = el.dataset.href)));
 }
 function docCard(d) {
-  return `<div class="card doc-card" data-path="${esc(d.path)}">
-    <div class="top"><span class="xl-icon lg">X</span><div style="min-width:0"><h4>${esc(d.name)}</h4><div class="path">${esc(d.file)} · ${fmtSize(d.size)}</div></div></div>
-    <div class="meta"><span class="pill ${statusClass(d.status)}">${esc(d.status)}</span><span class="pill rev">Rev ${d.rev}</span><span>${plural(Math.max(0, d.revisions - 1), "saved change set")}</span></div>
+  return `<div class="card doc-card" data-path="${esc(d.path)}" title="Open ${esc(d.file)}">
+    <div class="top">${xlIcon(d, true)}<div style="min-width:0"><h4>${esc(d.name)}</h4><div class="path">${d.folder ? esc(d.folder) + " / " : ""}${esc(d.file)} · ${fmtSize(d.size)}</div></div></div>
+    <div class="meta">${d.supported === false ? `<span class="pill st-in-review">Old .${esc(d.format)} format — click to convert</span>` : `<span class="pill ${statusClass(d.status)}">${esc(d.status)}</span><span class="pill rev">Rev ${d.rev}</span><span>${plural(Math.max(0, d.revisions - 1), "saved change set")}</span>`}</div>
     <div class="foot"><span class="who">${d.lastUser ? `<span class="avatar sm">${esc(initials(d.lastUser))}</span>${esc(d.lastUser)}` : "—"}</span><span title="${esc(fullTime(d.modified))}">${timeAgo(d.modified)}</span></div>
   </div>`;
 }
@@ -617,14 +634,26 @@ async function showEditor(path, rev) {
   const main = $("#main");
   const same = S.doc && S.doc.path === path && (S.doc.viewingRev ?? null) === (rev ?? null);
   if (!same) {
-    main.innerHTML = `<div class="loading"><div class="spinner"></div>Opening document…</div>`;
+    const file = path.split("/").pop();
+    main.innerHTML = `<div class="loading"><div class="spinner"></div><div>Opening <b>${esc(file)}</b>…</div><small id="openTimer" style="color:var(--faint)"></small></div>`;
+    const t0 = Date.now();
+    const timer = setInterval(() => {
+      const el = $("#openTimer");
+      if (!el) return clearInterval(timer);
+      const sec = Math.round((Date.now() - t0) / 1000);
+      if (sec >= 3) el.textContent = `${sec}s — large workbooks can take a little while the first time`;
+    }, 1000);
     let doc;
     try {
       doc = await getJSON(`/api/document?path=${enc(path)}${rev != null ? `&rev=${rev}` : ""}`);
     } catch (err) {
-      main.innerHTML = `<div class="page"><div class="empty-state"><div class="big">${I.alert}</div><h3>Could not open this document</h3><p>${esc(err.message)}</p><a class="btn" href="#/">Back to overview</a></div></div>`;
+      clearInterval(timer);
+      if (parseHash().path !== path) return;
+      renderOpenError(path, err);
       return;
     }
+    clearInterval(timer);
+    if (parseHash().view !== "doc" || parseHash().path !== path) return;
     const keepSheet = S.doc && S.doc.path === path ? sheet()?.name : null;
     const prevPath = S.doc?.path;
     S.doc = doc;
@@ -635,6 +664,44 @@ async function showEditor(path, rev) {
   }
   renderEditor();
   if (!same && !readOnly()) offerDraft();
+}
+
+function renderOpenError(path, err) {
+  const main = $("#main");
+  const data = err.data || {};
+  const file = path.split("/").pop();
+  const legacy = data.code === "legacy";
+  const titles = {
+    legacy: "Old Excel format", encrypted: "This workbook is protected", locked: "The file is in use",
+    corrupt: "Not a valid Excel file", unreadable: "The file could not be read", parse: "The workbook could not be read",
+  };
+  main.innerHTML = `<div class="page"><div class="card open-error">
+    <div class="big">${legacy ? I.file : I.alert}</div>
+    <h3>${esc(titles[data.code] || "Could not open this document")}</h3>
+    <div class="fname">${xlIcon({ file, supported: !legacy, format: file.split(".").pop() })}<span>${esc(path.split("/").join(" › "))}</span></div>
+    <p>${esc(err.message)}</p>
+    ${data.hint ? `<p class="hint">${I.info}<span>${esc(data.hint)}</span></p>` : ""}
+    ${data.detail ? `<details><summary>Technical details</summary><pre>${esc(data.detail.join("\n"))}</pre></details>` : ""}
+    <div class="actions">
+      <a class="btn" href="${folderHash([S.sel.model, S.sel.milestone, S.sel.variant])}">${I.arrowLeft}Back</a>
+      <button class="btn" id="oeDownload">${I.download}Download file</button>
+      <button class="btn" id="oeRetry">${I.restore}Try again</button>
+      ${legacy ? `<button class="btn primary" id="oeConvert">${I.copy}Convert to .xlsx</button>` : ""}
+    </div></div></div>`;
+  $("#oeDownload").addEventListener("click", () => download(`/api/export?path=${enc(path)}`, null, file).catch((e) => toast(e.message, "error")));
+  $("#oeRetry").addEventListener("click", () => { S.doc = null; showEditor(path, parseHash().rev); });
+  $("#oeConvert")?.addEventListener("click", async (e) => {
+    e.currentTarget.disabled = true;
+    e.currentTarget.innerHTML = `<span class="spinner" style="width:16px;height:16px;border-width:2px"></span>Converting…`;
+    try {
+      const r = await postJSON("/api/convert", { path, user: S.user });
+      await loadTree();
+      toast("Converted — the original .xls is kept alongside");
+      openDoc(r.path);
+    } catch (ex) {
+      renderOpenError(path, ex);
+    }
+  });
 }
 
 async function offerDraft() {
@@ -659,12 +726,13 @@ function renderEditor() {
   const d = S.doc;
   const main = $("#main");
   const ro = readOnly();
-  const segs = d.path.split("/");
+  const segs = d.path.split("/").slice(0, -1);
+  const crumbHtml = segs.map((p, i) => `<span class="sep">/</span><a href="${folderHash(segs.slice(0, Math.min(i + 1, 3)))}">${esc(p)}</a>`).join("");
   const statuses = S.tree?.statuses || ["Draft", "In Review", "Approved", "Released"];
   main.innerHTML = `<div class="editor">
     <div class="ed-head">
       <div class="ed-title">
-        <div class="crumbs"><a href="#/">Home</a><span class="sep">/</span><a href="${folderHash([segs[0]])}">${esc(segs[0])}</a><span class="sep">/</span><a href="${folderHash(segs.slice(0, 2))}">${esc(segs[1])}</a><span class="sep">/</span><a href="${folderHash(segs.slice(0, 3))}">${esc(segs[2])}</a></div>
+        <div class="crumbs"><a href="#/">Home</a>${crumbHtml}</div>
         <h2><span class="xl-icon">X</span><span class="name" title="${esc(d.file)}">${esc(d.name)}</span>
           ${ro ? `<span class="pill rev nodot">Viewing Rev ${d.viewingRev}</span>` : `<select class="status-select pill ${statusClass(d.status)}" id="edStatus">${statuses.map((s) => `<option ${s === d.status ? "selected" : ""}>${s}</option>`).join("")}</select>`}
         </h2>

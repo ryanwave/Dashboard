@@ -9,7 +9,15 @@ from urllib.parse import quote
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
-from .storage import Conflict, FileLocked, Store
+import logging
+import traceback
+
+from werkzeug.exceptions import HTTPException
+
+from .excel_writer import EditError
+from .storage import Conflict, DocError, FileLocked, Store
+
+log = logging.getLogger("dochub")
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
 
@@ -22,8 +30,8 @@ def create_app(root: str) -> Flask:
     store = Store(root)
     app.store = store
 
-    def err(msg, code=400, **extra):
-        return jsonify({"error": msg, **extra}), code
+    def err(msg, status=400, **extra):
+        return jsonify({"error": msg, **extra}), status
 
     @app.errorhandler(PermissionError)
     def _perm(e):
@@ -49,6 +57,24 @@ def create_app(root: str) -> Flask:
     def _locked(e):
         return err(str(e), 423)
 
+    @app.errorhandler(EditError)
+    def _edit(e):
+        return err(str(e), 422)
+
+    @app.errorhandler(DocError)
+    def _doc(e):
+        return err(e.message, 422, code=e.code, hint=e.hint)
+
+    @app.errorhandler(Exception)
+    def _any(e):
+        if isinstance(e, HTTPException):
+            return err(e.description or e.name, e.code or 500)
+        tb = traceback.format_exc()
+        log.error("Unhandled error on %s %s\n%s", request.method, request.full_path, tb)
+        print(tb, flush=True)
+        return err(f"Server error: {type(e).__name__}: {e}", 500,
+                   detail=tb.strip().splitlines()[-6:])
+
     # -------------------------------------------------------------- static
     @app.get("/")
     def index():
@@ -68,7 +94,13 @@ def create_app(root: str) -> Flask:
     @app.get("/api/stats")
     def stats():
         t = store.tree()
-        docs = [d for m in t["models"] for ms in m["milestones"] for v in ms["variants"] for d in v["documents"]]
+        docs = list(t["rootDocuments"])
+        for m in t["models"]:
+            docs += m["documents"]
+            for ms in m["milestones"]:
+                docs += ms["documents"]
+                for v in ms["variants"]:
+                    docs += v["documents"]
         activity = store.activity()
         today = dt.date.today()
         days = [today - dt.timedelta(days=i) for i in range(13, -1, -1)]
@@ -156,6 +188,11 @@ def create_app(root: str) -> Flask:
         path = body["path"]
         data = store.render_with_edits(path, body.get("edits") or {})
         return _download(data, Path(path).stem + Path(path).suffix)
+
+    @app.post("/api/convert")
+    def convert():
+        body = request.get_json(force=True)
+        return jsonify({"path": store.convert_legacy(body["path"], body.get("user"))})
 
     @app.post("/api/folder")
     def folder():

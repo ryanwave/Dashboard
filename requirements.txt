@@ -3,3 +3,4 @@ openpyxl>=3.1
 lxml>=4.9
 waitress>=2.1
 pillow>=10.0
+pywin32>=306; sys_platform == "win32"

@@ -432,6 +432,13 @@ def build(root: Path):
                 if seed % 2:
                     dvp_workbook(model).save(d / f"DVP Plan - {model}.xlsx")
                 seed += 1
+    # documents in a sub-folder, directly in a milestone, and in the old .xls format
+    sub = root / "P115" / "M1 - Concept" / "DC_NFB_2WD_1.25T" / "Supplier inputs"
+    sub.mkdir(parents=True, exist_ok=True)
+    dvp_workbook("P115 Supplier").save(sub / "Tyre supplier data.xlsx")
+    dvp_workbook("P149").save(root / "P149" / "M1 - Concept" / "Milestone checklist.xlsx")
+    (root / "P201" / "M0 - Kickoff" / "Base_2WD" / "Legacy costing sheet.xls").write_bytes(
+        bytes.fromhex("d0cf11e0a1b11ae1") + bytes(504))
 
 
 def store_formula_results(root: Path):
@@ -527,7 +534,7 @@ def seed_history(root: Path):
     act.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines) + "\n", encoding="utf-8")
     for rj in (store.meta_root / "docs").rglob("revisions.json"):
         revs = json.loads(rj.read_text(encoding="utf-8"))
-        rel = rj.parent.relative_to(store.meta_root / "docs").as_posix()
+        rel = (rj.parent / "path.txt").read_text(encoding="utf-8")
         first = None
         for r in revs:
             key = (rel, r["rev"], "edit")
