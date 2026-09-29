@@ -373,7 +373,14 @@ def rich_html(value: CellRichText, theme) -> str:
 # Workbook -> model
 # --------------------------------------------------------------------------
 def col_width_px(width_chars: float) -> int:
-    return max(0, int(round(width_chars * 7 + 5))) if width_chars else 0
+    """Excel column width (as stored in the file) -> screen pixels at 100%.
+
+    Excel's own formula with a 7px maximum digit width (Calibri 11 / Arial 10):
+    pixels = trunc(((256 * width + trunc(128 / 7)) / 256) * 7)
+    """
+    if not width_chars:
+        return 0
+    return int(((256 * float(width_chars) + 18) / 256) * 7)
 
 
 def row_height_px(points: float) -> int:
@@ -484,10 +491,11 @@ def sheet_model(ws, cached, wb, theme) -> dict:
     max_r, max_c = min(max_r, MAX_ROWS), min(max_c, MAX_COLS)
 
     fmt = ws.sheet_format
-    default_w = fmt.defaultColWidth or ((fmt.baseColWidth or 8) + 0.43 if fmt.baseColWidth else DEFAULT_COL_WIDTH)
+    # Default: defaultColWidth if stored, else baseColWidth (8) chars + 5px padding = 64px
+    default_px = col_width_px(fmt.defaultColWidth) if fmt.defaultColWidth else int((fmt.baseColWidth or 8) * 7 + 5)
     default_h = fmt.defaultRowHeight or DEFAULT_ROW_HEIGHT
 
-    col_widths = [col_width_px(default_w)] * (max_c + 1)
+    col_widths = [default_px] * (max_c + 1)
     hidden_cols = set()
     for dim in ws.column_dimensions.values():
         lo, hi = dim.min or 0, dim.max or 0
@@ -626,7 +634,8 @@ def sheet_model(ws, cached, wb, theme) -> dict:
         "truncated": truncated,
         "colWidths": col_widths,
         "rowHeights": row_heights,
-        "customHeights": sorted(r for r, d in ws.row_dimensions.items() if d.ht and r <= max_r),
+        "customHeights": sorted(r for r, d in ws.row_dimensions.items()
+                                if d.ht and d.customHeight and r <= max_r),
         "hiddenRows": sorted(hidden_rows),
         "hiddenCols": sorted(hidden_cols),
         "merges": merges,

@@ -1,7 +1,7 @@
 # DocHub — Engineering Document Workspace
 
-DocHub turns a shared folder of Excel sheets into a web app. Users pick
-**Model → Milestone → Variant**, open a document, and edit it in the browser. The
+DocHub turns a shared folder of Excel sheets into a web app. Users browse
+**Model → Milestone → Variant** in a folder tree, open a document, and edit it in the browser. The
 sheet looks like it does in Excel: the same merged cells, colours, borders,
 rotated labels, logos, dropdowns and notes. DocHub records every change
 automatically.
@@ -18,7 +18,7 @@ automatically.
 | Nobody knows who changed which value, or when | Every save records **who, when, why, and the exact cells changed (old → new)** |
 | Many copies of the same file ("_v3_final_rev2.xlsx") | **One live file per document**. Older versions are kept automatically and can be restored with one click |
 | Two people edit the same file and one overwrites the other | **Conflict detection**: the second person is warned and their edits are kept |
-| Hard to find the right document | Model / Milestone / Variant drop-downs plus instant search (Ctrl K) |
+| Hard to find the right document | Explorer tree (Model › Milestone › Variant › sub-folders) plus instant search (Ctrl K) |
 | No overview for management | Dashboard with document count, revisions, contributors, status (Draft → In Review → Approved → Released) and a live audit trail |
 | People still need the Excel file | **Export to .xlsx at any time**, with or without unsaved edits. The server file stays a normal Excel file |
 
@@ -42,6 +42,13 @@ automatically.
   revision with a cell-by-cell diff.
 - **Unsaved work is never lost**: pending edits are kept in the browser and can
   be restored after a crash or a closed tab.
+- **Explorer tree**: expands one folder at a time and remembers what was open. Each folder
+  lists its documents as rows showing the full name, when it was last edited, who edited it
+  (from DocHub's history, or Excel's "Last Modified By"), sign-off status and revision. Click
+  a column heading to sort.
+- **Sized like Excel**: Excel's column-width formula, the sheet's own zoom, automatic fit to the
+  window (Fit, 100%, +/−, Ctrl + mouse wheel), frozen panes, and fixed row heights that clip
+  text as Excel does.
 - **Document management**: create Model / Milestone / Variant folders, upload
   workbooks, copy a document to another variant, and set a status.
 

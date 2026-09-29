@@ -183,3 +183,23 @@ def test_documents_in_subfolders_and_milestones(root):
     assert [d["name"] for d in ms["documents"]] == ["Loose"]
     deep = [d for d in ms["variants"][0]["documents"] if d["name"] == "Deep"][0]
     assert deep["folder"] == "Sub" and deep["path"] == "M/MS/V/Sub/Deep.xlsx"
+
+
+def test_edited_by_uses_excel_author_then_dochub_user(root):
+    f = root / "M/MS/V/Doc.xlsx"
+    wb = load_workbook(f)
+    wb.properties.lastModifiedBy = "Priya (Excel)"
+    wb.save(f)
+    c = create_app(str(root)).test_client()
+    doc = c.get("/api/tree").get_json()["models"][0]["milestones"][0]["variants"][0]["documents"][0]
+    assert doc["editedBy"] == "Priya (Excel)" and doc["editedAt"]
+    c.post("/api/save", json={"path": "M/MS/V/Doc.xlsx", "baseRev": None, "user": "Alice", "note": "",
+                              "edits": {"Data": {"1,1": "Changed"}}})
+    doc = c.get("/api/tree").get_json()["models"][0]["milestones"][0]["variants"][0]["documents"][0]
+    assert doc["editedBy"] == "Alice"
+    assert load_workbook(f).properties.lastModifiedBy == "Alice"  # Excel's File > Info shows it too
+
+
+def test_column_width_matches_excel():
+    assert excel_reader.col_width_px(9.140625) == 64   # Excel default column
+    assert excel_reader.col_width_px(30) == 210

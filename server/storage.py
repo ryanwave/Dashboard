@@ -20,6 +20,7 @@ import os
 import shutil
 import tempfile
 import threading
+import zipfile
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -33,6 +34,7 @@ STATUSES = ["Draft", "In Review", "Approved", "Released"]
 META_DIR = ".dochub"
 
 _lock = threading.RLock()
+_core_cache: dict = {}
 
 
 class Conflict(Exception):
@@ -165,6 +167,20 @@ class Store:
                 continue
         return out
 
+    def _core_props(self, f: Path, mtime: float) -> dict:
+        key = (str(f), mtime)
+        hit = _core_cache.get(key)
+        if hit is None:
+            try:
+                with zipfile.ZipFile(f) as z:
+                    hit = excel_writer.read_core(z)
+            except Exception:
+                hit = {}
+            _core_cache[key] = hit
+            if len(_core_cache) > 5000:
+                _core_cache.clear()
+        return hit
+
     def doc_summary(self, f: Path, base: Path) -> dict:
         rel = self.rel(f)
         try:
@@ -176,6 +192,21 @@ class Store:
         last = revs[-1] if revs else None
         meta = self._read_meta(rel)
         sub = f.parent.relative_to(base).as_posix() if f.parent != base else ""
+        modified = dt.datetime.fromtimestamp(mtime).astimezone()
+        # Who edited last: DocHub's own log if it is up to date with the file,
+        # otherwise the "Last Modified By" that Excel stores inside the file.
+        tracked = last is not None and (last.get("mtime") == mtime or
+                                        abs(dt.datetime.fromisoformat(last["time"]).timestamp() - mtime) < 5)
+        if tracked:
+            edited_by, edited_at = last["user"], last["time"]
+            if edited_by == "System":
+                core = self._core_props(f, mtime) if f.suffix.lower() in DOC_EXTS else {}
+                edited_by = core.get("lastModifiedBy") or core.get("creator") or "—"
+                edited_at = modified.isoformat(timespec="seconds")
+        else:
+            core = self._core_props(f, mtime) if f.suffix.lower() in DOC_EXTS else {}
+            edited_by = core.get("lastModifiedBy") or core.get("creator") or "—"
+            edited_at = modified.isoformat(timespec="seconds")
         return {
             "name": f.stem,
             "file": f.name,
@@ -184,7 +215,9 @@ class Store:
             "format": f.suffix.lower().lstrip("."),
             "supported": f.suffix.lower() in DOC_EXTS,
             "size": size,
-            "modified": dt.datetime.fromtimestamp(mtime).astimezone().isoformat(timespec="seconds"),
+            "modified": modified.isoformat(timespec="seconds"),
+            "editedAt": edited_at,
+            "editedBy": edited_by,
             "rev": last["rev"] if last else 0,
             "revisions": len(revs),
             "lastUser": last["user"] if last else None,
@@ -395,7 +428,7 @@ class Store:
             typed, changes = self._typed_edits(f, edits)
             if not changes:
                 return {"saved": False, "rev": latest["rev"], "changes": []}
-            data = excel_writer.apply_edits(f.read_bytes(), typed)
+            data = excel_writer.apply_edits(f.read_bytes(), typed, user)
             tmp = f.with_name(f".{f.name}.dochub.tmp")
             tmp.write_bytes(data)
             try:

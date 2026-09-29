@@ -5,6 +5,9 @@
 const I = {
   home: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>',
   folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+  folderOpen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V6a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v1"/><path d="M3.5 20h14.3a2 2 0 0 0 1.9-1.4L22 11H6.2a2 2 0 0 0-1.9 1.4L2 19a1 1 0 0 0 1 1z"/></svg>',
+  collapse: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 20l5-5 5 5M7 4l5 5 5-5"/></svg>',
+  fit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>',
   folderPlus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v5M9.5 13.5h5"/></svg>',
   upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3M12 3v13M7 8l5-5 5 5"/></svg>',
   download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3M12 3v13M7 11l5 5 5-5"/></svg>',
@@ -150,12 +153,15 @@ const S = {
   redo: [],
   cur: { r: 1, c: 1 },
   zoom: 1,
+  zoomMode: "fit",
   drawer: false,
   history: [],
   openRev: null,
   hl: null,
   find: { q: "", hits: [], i: -1 },
   tdMap: new Map(),
+  open: new Set((() => { try { return JSON.parse(localStorage.getItem("dochub:tree") || "[]"); } catch (_) { return []; } })()),
+  docSort: { key: "name", dir: 1 },
 };
 
 function allDocs() {
@@ -200,39 +206,7 @@ async function askUser(force = false) {
   if (name) { S.user = name; localStorage.setItem("dochub:user", name); paintUser(); }
 }
 
-// ---------------------------------------------------------------- picker
-function fillSelect(sel, items, value, placeholder) {
-  sel.innerHTML = `<option value="">${placeholder}</option>` + items.map((n) => `<option ${n === value ? "selected" : ""}>${esc(n)}</option>`).join("");
-  sel.disabled = items.length === 0;
-}
-function paintPicker() {
-  const { m, ms } = findNode(S.sel.model, S.sel.milestone);
-  fillSelect($("#selModel"), (S.tree?.models || []).map((x) => x.name), S.sel.model, "Select model…");
-  fillSelect($("#selMilestone"), m ? m.milestones.map((x) => x.name) : [], S.sel.milestone, m ? "Select milestone…" : "—");
-  fillSelect($("#selVariant"), ms ? ms.variants.map((x) => x.name) : [], S.sel.variant, ms ? "Select variant…" : "—");
-}
 function folderHash(parts) { return "#/f/" + parts.filter(Boolean).map(enc).join("/"); }
-function bindPicker() {
-  $("#selModel").addEventListener("change", (e) => {
-    const m = S.tree.models.find((x) => x.name === e.target.value);
-    const parts = [e.target.value];
-    if (m && m.milestones.length === 1) {
-      parts.push(m.milestones[0].name);
-      if (m.milestones[0].variants.length === 1) parts.push(m.milestones[0].variants[0].name);
-    }
-    location.hash = e.target.value ? folderHash(parts) : "#/";
-  });
-  $("#selMilestone").addEventListener("change", (e) => {
-    const { m } = findNode(S.sel.model);
-    const ms = m?.milestones.find((x) => x.name === e.target.value);
-    const parts = [S.sel.model, e.target.value];
-    if (ms && ms.variants.length === 1) parts.push(ms.variants[0].name);
-    location.hash = folderHash(e.target.value ? parts : [S.sel.model]);
-  });
-  $("#selVariant").addEventListener("change", (e) => {
-    location.hash = folderHash([S.sel.model, S.sel.milestone, e.target.value]);
-  });
-}
 
 // ---------------------------------------------------------------- search
 function bindSearch() {
@@ -291,7 +265,9 @@ async function route() {
     const segs = r.path.split("/").slice(0, -1);
     S.sel = d ? { model: d.model, milestone: d.milestone, variant: d.variant }
       : { model: segs[0] || "", milestone: segs[1] || "", variant: segs[2] || "" };
-    paintPicker();
+    const segsAll = r.path.split("/").slice(0, -1);
+    for (let i = 1; i <= segsAll.length; i++) S.open.add(segsAll.slice(0, i).join("/"));
+    saveOpen();
     renderSidebar(r.path);
     await showEditor(r.path, r.rev);
   } else {
@@ -300,60 +276,137 @@ async function route() {
       const [model = "", milestone = "", variant = ""] = r.parts;
       S.sel = { model, milestone, variant };
     } else S.sel = { model: "", milestone: "", variant: "" };
-    paintPicker();
+    if (r.view === "folder") for (let i = 1; i <= r.parts.length; i++) S.open.add(r.parts.slice(0, i).join("/"));
+    saveOpen();
     renderSidebar();
     if (r.view === "folder") renderFolder(r.parts); else await renderHome();
   }
 }
 
-// ---------------------------------------------------------------- sidebar
+// ---------------------------------------------------------------- sidebar (folder tree)
+function saveOpen() { try { localStorage.setItem("dochub:tree", JSON.stringify([...S.open])); } catch (_) { /* ignore */ } }
+
+/** Model › Milestone › Variant › (sub-folders) › documents, as generic nodes. */
+function buildTree() {
+  const mk = (name, parts, kind) => ({ name, parts, kind, id: parts.join("/"), folders: [], docs: [] });
+  const root = mk("", [], "root");
+  root.docs = S.tree?.rootDocuments || [];
+  for (const m of S.tree?.models || []) {
+    const nm = mk(m.name, [m.name], "model");
+    nm.docs = m.documents || [];
+    for (const ms of m.milestones) {
+      const nms = mk(ms.name, [m.name, ms.name], "milestone");
+      nms.docs = ms.documents || [];
+      for (const v of ms.variants) {
+        const nv = mk(v.name, [m.name, ms.name, v.name], "variant");
+        for (const d of v.documents) {
+          let node = nv;
+          for (const part of (d.folder || "").split("/").filter(Boolean)) {
+            let child = node.folders.find((f) => f.name === part);
+            if (!child) { child = mk(part, [...node.parts, part], "sub"); node.folders.push(child); }
+            node = child;
+          }
+          node.docs.push(d);
+        }
+        nms.folders.push(nv);
+      }
+      nm.folders.push(nms);
+    }
+    root.folders.push(nm);
+  }
+  const count = (n) => (n.count = n.docs.length + n.folders.reduce((a, f) => a + count(f), 0));
+  count(root);
+  return root;
+}
+
+const KIND_LABEL = { model: "Model", milestone: "Milestone", variant: "Variant", sub: "Folder" };
+
+function treeHtml(node, depth, active) {
+  let html = "";
+  for (const f of node.folders) {
+    const open = S.open.has(f.id);
+    const current = active.folder === f.id;
+    html += `<div class="tn">
+      <div class="trow folder ${open ? "open" : ""} ${current ? "current" : ""}" style="--d:${depth}" data-id="${esc(f.id)}" data-kind="${f.kind}" title="${esc(KIND_LABEL[f.kind])}: ${esc(f.name)}">
+        <span class="tw">${I.chevRight}</span>
+        <span class="ti">${open ? I.folderOpen : I.folder}</span>
+        <span class="nm">${esc(f.name)}</span><span class="ct">${f.count}</span>
+      </div>
+      ${open ? `<div class="tkids">${treeHtml(f, depth + 1, active)}${!f.folders.length && !f.docs.length ? `<div class="tempty" style="--d:${depth + 1}">Empty</div>` : ""}</div>` : ""}
+    </div>`;
+  }
+  for (const d of node.docs) {
+    html += `<div class="trow doc ${active.doc === d.path ? "current" : ""}" style="--d:${depth}" data-path="${esc(d.path)}" title="${esc(d.file)}\n${esc(d.status)} · edited ${esc(fullTime(d.editedAt))} by ${esc(d.editedBy || "—")}">
+      <span class="tw"></span>${xlIcon(d)}<span class="nm">${esc(d.name)}</span>
+      ${d.supported === false ? `<span class="tdot" style="background:#dc6803" title="Old format"></span>` : `<span class="tdot ${statusClass(d.status)}" title="${esc(d.status)}"></span>`}
+    </div>`;
+  }
+  return html;
+}
+
 function renderSidebar(activePath) {
   const sb = $("#sidebar");
-  const { m, ms, v } = findNode(S.sel.model, S.sel.milestone, S.sel.variant);
-  const home = parseHash().view === "home";
-  let html = `<div class="side-section">
-    <button class="nav-item ${home ? "active" : ""}" data-href="#/">${I.home}Overview</button>
-  </div>`;
-  html += `<div class="side-scroll">`;
-  if (v) {
-    html += `<div class="side-section"><div class="side-title"><span>Documents</span><span>${v.documents.length}</span></div>
-      <div class="tree-ctx"><b>${esc(m.name)}</b> › ${esc(ms.name)} › <b>${esc(v.name)}</b></div>`;
-    html += v.documents.length
-      ? v.documents.map((d) => sideDoc(d, activePath)).join("")
-      : `<div class="side-empty">No documents in this variant yet. Upload an Excel file to get started.</div>`;
-    html += `</div>`;
-  } else {
-    const level = ms ? ms.variants : m ? m.milestones : S.tree?.models || [];
-    const title = ms ? "Variants" : m ? "Milestones" : "Models";
-    const base = [S.sel.model, S.sel.milestone].filter(Boolean);
-    html += `<div class="side-section"><div class="side-title"><span>${title}</span><span>${level.length}</span></div>`;
-    if (m) html += `<div class="tree-ctx"><b>${esc(m.name)}</b>${ms ? " › " + esc(ms.name) : ""}</div>`;
-    html += level.map((x) => {
-      const count = countDocs(x);
-      return `<button class="nav-item" data-href="${folderHash([...base, x.name])}">${I.folder}<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(x.name)}</span><span class="count">${count}</span></button>`;
-    }).join("") || `<div class="side-empty">Nothing here yet.</div>`;
-    html += `</div>`;
-    const loose = ms ? ms.documents : m ? m.documents : S.tree?.rootDocuments;
-    if (loose && loose.length) html += `<div class="side-section"><div class="side-title"><span>Documents here</span><span>${loose.length}</span></div>${loose.map((d) => sideDoc(d, activePath)).join("")}</div>`;
-  }
-  html += `</div>`;
+  const r = parseHash();
+  const home = r.view === "home";
+  const active = { doc: activePath || null, folder: r.view === "folder" ? r.parts.join("/") : null };
+  const tree = buildTree();
+  const keepScroll = $(".side-scroll", sb)?.scrollTop || 0;
+  const { v } = findNode(S.sel.model, S.sel.milestone, S.sel.variant);
   const depth = [S.sel.model, S.sel.milestone, S.sel.variant].filter(Boolean).length;
   const newLabel = ["Model", "Milestone", "Variant"][depth];
-  html += `<div class="side-foot">
-    ${v ? `<button class="btn sm primary" id="sbUpload">${I.upload}Upload Excel</button>` : ""}
-    ${newLabel ? `<button class="btn sm" id="sbNew">${I.folderPlus}New ${newLabel}</button>` : ""}
-  </div>`;
-  sb.innerHTML = html;
-  sb.querySelectorAll("[data-href]").forEach((el) => el.addEventListener("click", () => (location.hash = el.dataset.href)));
-  sb.querySelectorAll(".doc-link").forEach((el) => el.addEventListener("click", () => openDoc(el.dataset.path)));
+  sb.innerHTML = `<div class="side-section">
+      <button class="nav-item ${home ? "active" : ""}" data-href="#/">${I.home}Overview</button>
+    </div>
+    <div class="side-title tree-title"><span>Explorer</span>
+      <button class="btn sm icon ghost" id="treeCollapse" title="Collapse all">${I.collapse}</button></div>
+    <div class="side-scroll tree" role="tree">${treeHtml(tree, 0, active) || `<div class="side-empty">No folders found under ${esc(S.tree?.root || "")}.</div>`}</div>
+    <div class="side-foot">
+      ${v ? `<button class="btn sm primary" id="sbUpload">${I.upload}Upload Excel</button>` : ""}
+      ${newLabel ? `<button class="btn sm" id="sbNew">${I.folderPlus}New ${newLabel}</button>` : ""}
+    </div>
+    <div class="resizer" id="sbResize" title="Drag to resize"></div>`;
+  $(".side-scroll", sb).scrollTop = keepScroll;
+  sb.querySelector("[data-href]").addEventListener("click", () => (location.hash = "#/"));
+  $("#treeCollapse").addEventListener("click", () => { S.open.clear(); saveOpen(); renderSidebar(activePath); });
+  sb.querySelectorAll(".trow.folder").forEach((el) => el.addEventListener("click", (e) => {
+    const id = el.dataset.id;
+    const parts = id.split("/");
+    const navigable = el.dataset.kind !== "sub";
+    const isCurrent = r.view === "folder" && r.parts.join("/") === id;
+    if (e.target.closest(".tw") || !navigable) {
+      S.open.has(id) ? S.open.delete(id) : S.open.add(id);
+      saveOpen();
+      renderSidebar(activePath);
+      return;
+    }
+    if (S.open.has(id) && isCurrent) { S.open.delete(id); saveOpen(); renderSidebar(activePath); return; }
+    S.open.add(id);
+    saveOpen();
+    if (isCurrent) renderSidebar(activePath); else location.hash = folderHash(parts);
+  }));
+  sb.querySelectorAll(".trow.doc").forEach((el) => el.addEventListener("click", () => openDoc(el.dataset.path)));
+  sb.querySelector(".trow.current")?.scrollIntoView({ block: "nearest" });
   $("#sbUpload")?.addEventListener("click", () => uploadDialog());
   $("#sbNew")?.addEventListener("click", () => newFolderDialog());
+  bindResizer();
 }
-function sideDoc(d, activePath) {
-  return `<div class="doc-link ${d.path === activePath ? "active" : ""}" data-path="${esc(d.path)}" title="${esc(d.file)}">
-    ${xlIcon(d)}<div style="min-width:0"><div class="t">${esc(d.name)}</div>
-    <small>${d.folder ? `<span class="subdir">${I.folder.replace("<svg", '<svg width="12" height="12"')}${esc(d.folder)}</span>` : ""}
-    ${d.supported === false ? `<span class="pill st-in-review nodot">.${esc(d.format)}</span>` : `<span class="pill ${statusClass(d.status)}">${esc(d.status)}</span>Rev ${d.rev}`}</small></div></div>`;
+
+function bindResizer() {
+  const h = $("#sbResize");
+  h.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    const move = (ev) => {
+      const w = Math.max(220, Math.min(560, ev.clientX));
+      document.documentElement.style.setProperty("--sidebar", w + "px");
+    };
+    const up = () => {
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+      try { localStorage.setItem("dochub:sidebar", getComputedStyle(document.documentElement).getPropertyValue("--sidebar").trim()); } catch (_) { /* ignore */ }
+    };
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+  });
 }
 function countDocs(node) {
   let n = (node.documents || []).length;
@@ -378,10 +431,10 @@ async function renderHome() {
     <section class="hero">
       <div>
         <h1>${greeting()}${S.user ? ", " + esc(S.user.split(" ")[0]) : ""}</h1>
-        <p>Every engineering sheet in one place. Pick a <b>Model → Milestone → Variant</b> to open its documents, edit them like Excel, and let DocHub record every change automatically.</p>
+        <p>Every engineering sheet in one place. Open a <b>Model → Milestone → Variant</b> in the explorer on the left, click a document to edit it like Excel, and DocHub records every change automatically.</p>
         <div class="path-chip">${I.folder.replace("<svg", '<svg width="14" height="14"')} ${esc(st.root)}</div>
       </div>
-      <button class="btn" id="heroBrowse">${I.folder}Browse documents</button>
+      <button class="btn" id="heroBrowse">${I.search}Find a document</button>
     </section>
 
     <div class="kpis">
@@ -410,7 +463,7 @@ async function renderHome() {
           <span class="when"><span class="pill ${statusClass(d.status)}">${esc(d.status)}</span></span></li>`).join("") || "<li>No documents yet.</li>"}</ul></div></div>
     </div>
   </div>`;
-  $("#heroBrowse").addEventListener("click", () => { $("#selModel").focus(); try { $("#selModel").showPicker(); } catch (_) { /* not supported */ } });
+  $("#heroBrowse").addEventListener("click", () => $("#search").focus());
 }
 function kpi(label, value, sub, icon, bg, fg) {
   return `<div class="card kpi"><div class="label">${label}</div><div class="ico" style="background:${bg};color:${fg}">${icon}</div>
@@ -481,13 +534,13 @@ function renderFolder(parts) {
   if (v) {
     main.innerHTML = `<div class="page">${head(v.name, `${plural(v.documents.length, "document")} in ${esc(m.name)} › ${esc(ms.name)}`,
       `<button class="btn" id="fNew">${I.folderPlus}New variant</button><button class="btn primary" id="fUpload">${I.upload}Upload Excel</button>`)}
-      ${v.documents.length ? `<div class="doc-grid">${v.documents.map(docCard).join("")}</div>`
+      ${v.documents.length ? `<div id="docTable"></div>`
         : `<div class="card empty-state"><div class="big">${I.upload}</div><h3>No documents yet</h3><p>Upload an Excel workbook, or copy one from another variant.</p><button class="btn primary" id="fUpload2">${I.upload}Upload Excel</button></div>`}
     </div>`;
     $("#fUpload").addEventListener("click", () => uploadDialog());
     $("#fUpload2")?.addEventListener("click", () => uploadDialog());
     $("#fNew").addEventListener("click", () => newFolderDialog(2));
-    $$(".doc-card", main).forEach((el) => el.addEventListener("click", () => openDoc(el.dataset.path)));
+    if (v.documents.length) renderDocTable($("#docTable"), v.documents);
     return;
   }
   const children = ms ? ms.variants : m.milestones;
@@ -507,17 +560,52 @@ function renderFolder(parts) {
         <div class="meta">${chips || '<span style="color:var(--faint)">Empty</span>'}</div>
         <div class="foot"><span>${last ? "Updated " + timeAgo(last.modified) : "No documents yet"}</span>${I.chevRight.replace("<svg", '<svg width="16" height="16"')}</div></div>`;
     }).join("") || `<div class="card empty-state" style="grid-column:1/-1"><div class="big">${I.folder}</div><h3>No ${childLabel.toLowerCase()}s yet</h3><p>Create one to start organising documents.</p></div>`}</div>
-    ${(ms || m).documents?.length ? `<h3 style="margin:28px 0 12px;font-size:16px">Documents in this folder</h3><div class="doc-grid">${(ms || m).documents.map(docCard).join("")}</div>` : ""}</div>`;
+    ${(ms || m).documents?.length ? `<h3 style="margin:28px 0 12px;font-size:16px">Documents in this folder</h3><div id="docTable"></div>` : ""}</div>`;
   $("#fNew").addEventListener("click", () => newFolderDialog());
-  $$(".doc-card[data-path]", main).forEach((el) => el.addEventListener("click", () => openDoc(el.dataset.path)));
+  if ((ms || m).documents?.length) renderDocTable($("#docTable"), (ms || m).documents);
   $$(".doc-card[data-href]", main).forEach((el) => el.addEventListener("click", () => (location.hash = el.dataset.href)));
 }
-function docCard(d) {
-  return `<div class="card doc-card" data-path="${esc(d.path)}" title="Open ${esc(d.file)}">
-    <div class="top">${xlIcon(d, true)}<div style="min-width:0"><h4>${esc(d.name)}</h4><div class="path">${d.folder ? esc(d.folder) + " / " : ""}${esc(d.file)} · ${fmtSize(d.size)}</div></div></div>
-    <div class="meta">${d.supported === false ? `<span class="pill st-in-review">Old .${esc(d.format)} format — click to convert</span>` : `<span class="pill ${statusClass(d.status)}">${esc(d.status)}</span><span class="pill rev">Rev ${d.rev}</span><span>${plural(Math.max(0, d.revisions - 1), "saved change set")}</span>`}</div>
-    <div class="foot"><span class="who">${d.lastUser ? `<span class="avatar sm">${esc(initials(d.lastUser))}</span>${esc(d.lastUser)}` : "—"}</span><span title="${esc(fullTime(d.modified))}">${timeAgo(d.modified)}</span></div>
+const SORTERS = {
+  name: (d) => (d.folder ? d.folder + "/" : "") + d.name.toLowerCase(),
+  edited: (d) => d.editedAt || "",
+  by: (d) => (d.editedBy || "").toLowerCase(),
+  status: (d) => ["Draft", "In Review", "Approved", "Released"].indexOf(d.status),
+  rev: (d) => d.rev,
+};
+function fmtDate(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" }) + ", " +
+    d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+/** Documents as wide rows: full name · last edited · edited by · sign-off status. */
+function renderDocTable(el, docs) {
+  const { key, dir } = S.docSort;
+  const sorted = docs.slice().sort((a, b) => {
+    const x = SORTERS[key](a), y = SORTERS[key](b);
+    return (x < y ? -1 : x > y ? 1 : 0) * dir;
+  });
+  const th = (k, label) => `<button class="dt-h ${key === k ? "on" : ""}" data-sort="${k}">${label}${key === k ? `<span class="arr">${dir > 0 ? "▲" : "▼"}</span>` : ""}</button>`;
+  el.innerHTML = `<div class="doc-table card" role="table">
+    <div class="dt-head" role="row">${th("name", "Document name")}${th("edited", "Last edited")}${th("by", "Edited by")}${th("status", "Sign-off status")}${th("rev", "Rev")}<span></span></div>
+    ${sorted.map((d) => `<div class="dt-row" role="row" tabindex="0" data-path="${esc(d.path)}" title="Open ${esc(d.file)}">
+      <div class="dt-name">${xlIcon(d, true)}<div><div class="fn">${esc(d.name)}<span class="ext">.${esc(d.format)}</span></div>
+        <small>${d.folder ? `${I.folder.replace("<svg", '<svg width="12" height="12"')} ${esc(d.folder)} · ` : ""}${fmtSize(d.size)}${d.supported === false ? " · old format — click to convert" : ""}</small></div></div>
+      <div class="dt-date"><div>${fmtDate(d.editedAt)}</div><small>${timeAgo(d.editedAt)}</small></div>
+      <div class="dt-by">${d.editedBy && d.editedBy !== "—" ? `<span class="avatar sm">${esc(initials(d.editedBy))}</span><span>${esc(d.editedBy)}</span>` : '<span class="muted">—</span>'}</div>
+      <div class="dt-status">${d.supported === false ? `<span class="pill st-in-review nodot">.${esc(d.format)}</span>` : `<span class="pill ${statusClass(d.status)}">${esc(d.status)}</span>`}</div>
+      <div class="dt-rev">${d.supported === false ? "—" : `Rev ${d.rev}`}</div>
+      <div class="dt-go">${I.chevRight}</div>
+    </div>`).join("")}
   </div>`;
+  el.querySelectorAll(".dt-h").forEach((b) => b.addEventListener("click", () => {
+    S.docSort = { key: b.dataset.sort, dir: S.docSort.key === b.dataset.sort ? -S.docSort.dir : b.dataset.sort === "edited" ? -1 : 1 };
+    renderDocTable(el, docs);
+  }));
+  el.querySelectorAll(".dt-row").forEach((r) => {
+    r.addEventListener("click", () => openDoc(r.dataset.path));
+    r.addEventListener("keydown", (e) => { if (e.key === "Enter") openDoc(r.dataset.path); });
+  });
 }
 
 // ---------------------------------------------------------------- dialogs
@@ -660,7 +748,7 @@ async function showEditor(path, rev) {
     if (prevPath !== path) { S.edits = {}; S.undo = []; S.redo = []; S.hl = null; S.openRev = null; S.find = { q: "", hits: [], i: -1 }; }
     const visible = doc.sheets.findIndex((s) => s.name === (keepSheet || doc.active) && s.state === "visible");
     S.sheetIdx = visible >= 0 ? visible : Math.max(0, doc.sheets.findIndex((s) => s.state === "visible"));
-    if (prevPath !== path) S.cur = { r: 1, c: 1 };
+    if (prevPath !== path) { S.cur = { r: 1, c: 1 }; S.zoomMode = "fit"; }
   }
   renderEditor();
   if (!same && !readOnly()) offerDraft();
@@ -758,7 +846,8 @@ function renderEditor() {
         <button class="btn sm icon ghost" id="findPrev" title="Previous">${I.chevDown.replace("<svg", '<svg style="transform:rotate(180deg);width:11px"')}</button>
         <button class="btn sm icon ghost" id="findNext" title="Next">${I.chevDown.replace("<svg", '<svg style="width:11px"')}</button></div>
       <span class="sep"></span>
-      <div class="zoom"><button class="btn sm icon ghost" id="zOut" title="Zoom out">${I.minus}</button><span id="zVal">${Math.round(S.zoom * 100)}%</span><button class="btn sm icon ghost" id="zIn" title="Zoom in">${I.plus}</button></div>
+      <div class="zoom"><button class="btn sm icon ghost" id="zOut" title="Zoom out">${I.minus}</button><button class="zval" id="zVal" title="Reset to 100%">${Math.round(S.zoom * 100)}%</button><button class="btn sm icon ghost" id="zIn" title="Zoom in">${I.plus}</button>
+        <button class="btn sm ghost tb-toggle ${S.zoomMode === "fit" ? "on" : ""}" id="zFit" title="Fit the sheet width to the window">${I.fit}Fit</button></div>
     </div>
     <div class="ed-body">
       <div class="grid-wrap" id="gridWrap" tabindex="0"><div class="grid-zoom" id="gridZoom"></div></div>
@@ -784,6 +873,13 @@ function renderEditor() {
   $("#tbRedo").addEventListener("click", redo);
   $("#zOut").addEventListener("click", () => setZoom(S.zoom - 0.1));
   $("#zIn").addEventListener("click", () => setZoom(S.zoom + 0.1));
+  $("#zVal").addEventListener("click", () => setZoom(1));
+  $("#zFit").addEventListener("click", () => setZoom(fitZoom(), "fit"));
+  $("#gridWrap").addEventListener("wheel", (e) => {
+    if (!e.ctrlKey) return;  // Ctrl + mouse wheel zooms the sheet, like Excel
+    e.preventDefault();
+    setZoom(S.zoom * (e.deltaY < 0 ? 1.1 : 1 / 1.1));
+  }, { passive: false });
   bindFx();
   bindFind();
   bindGrid();
@@ -792,10 +888,27 @@ function renderEditor() {
   if (S.drawer) renderDrawer();
 }
 
-function setZoom(z) {
-  S.zoom = Math.min(2, Math.max(0.5, Math.round(z * 10) / 10));
-  $("#gridZoom").style.zoom = S.zoom;
-  $("#zVal").textContent = Math.round(S.zoom * 100) + "%";
+function sheetWidth(sh) {
+  let w = 44;
+  for (let c = 1; c <= sh.maxCol; c++) if (!sh.hiddenCols.includes(c)) w += sh.colWidths[c] || 0;
+  return w;
+}
+/** Zoom that shows the whole sheet width (never above the sheet's own Excel zoom or 100%). */
+function fitZoom() {
+  const sh = sheet(), wrap = $("#gridWrap");
+  const avail = (wrap?.clientWidth || 1200) - 8;
+  const own = Math.min(1, (sh.zoom || 100) / 100);
+  // Very wide sheets stop at 65% (still readable) and scroll sideways instead.
+  return Math.max(0.65, Math.min(own, avail / (sheetWidth(sh) + 12)));
+}
+function setZoom(z, mode = "manual") {
+  S.zoom = Math.min(2, Math.max(0.4, Math.round(z * 100) / 100));
+  S.zoomMode = mode;
+  const el = $("#gridZoom");
+  if (el) el.style.zoom = S.zoom;
+  if ($("#zVal")) $("#zVal").textContent = Math.round(S.zoom * 100) + "%";
+  $("#zFit")?.classList.toggle("on", mode === "fit");
+  if ($("#gridZoom table")) applyFreeze();
 }
 
 // ---------------------------------------------------------------- sheet render
@@ -869,7 +982,9 @@ function renderSheet() {
   style.textContent = "td.frz{background-color:#fff}\n" + sh.styles.map((s, i) => `table.xl td.s${i}{${s}}`).join("\n");
 
   const imgs = imageMap(sh);
-  const fr = sh.freeze?.r || 0, fc = sh.freeze?.c || 0;
+  if (S.zoomMode === "fit") { S.zoom = fitZoom(); if ($("#zVal")) $("#zVal").textContent = Math.round(S.zoom * 100) + "%"; }
+  const { fr, fc } = freezeFor(sh);
+  const custom = new Set(sh.customHeights || []);
   const hdrW = 44, hdrH = 22;
   const leftOf = [0, hdrW];
   for (let c = 1; c <= sh.maxCol; c++) leftOf[c + 1] = leftOf[c] + (sh._hc.has(c) ? 0 : sh.colWidths[c]);
@@ -879,7 +994,7 @@ function renderSheet() {
   parts.push(`<table class="xl ${sh.gridLines ? "" : "nogrid"} ${readOnly() ? "readonly" : ""}" style="width:${leftOf[sh.maxCol + 1]}px"><colgroup><col style="width:${hdrW}px">`);
   for (let c = 1; c <= sh.maxCol; c++) parts.push(`<col style="width:${sh._hc.has(c) ? 0 : sh.colWidths[c]}px">`);
   parts.push(`</colgroup><thead><tr><th class="corner"></th>`);
-  for (let c = 1; c <= sh.maxCol; c++) parts.push(`<th data-hc="${c}"${c <= fc ? ` style="left:${leftOf[c]}px;z-index:8"` : ""}>${sh._hc.has(c) ? "" : colName(c)}</th>`);
+  for (let c = 1; c <= sh.maxCol; c++) parts.push(`<th data-hc="${c}"${c <= fc ? ` class="frz-h" style="left:${leftOf[c]}px"` : ""}>${sh._hc.has(c) ? "" : colName(c)}</th>`);
   parts.push(`</tr></thead><tbody>`);
   const edits = S.edits[sh.name] || {};
   for (let r = 1; r <= sh.maxRow; r++) {
@@ -902,11 +1017,17 @@ function renderSheet() {
         if (!mi.get(`${r},${c + 1}`) && !(nxt && (nxt.v || nxt.f)) && edits[`${r},${c + 1}`] === undefined) cls.push("ov");
       }
       if (sh._hc.has(c)) st += "padding:0;font-size:0;";
-      if (r <= fr || c <= fc) {
+      const r2 = m ? m.r2 : r, c2 = m ? m.c2 : c;
+      const frzR = r2 <= fr, frzC = c2 <= fc;   // only cells entirely inside the frozen pane stick
+      if (frzR || frzC) {
         cls.push("frz");
-        if (r <= fr) cls.push("frz-r");
-        if (c <= fc) { cls.push("frz-c"); st += `left:${leftOf[c]}px;`; }
+        if (frzR) cls.push("frz-r");
+        if (frzC) { cls.push("frz-c"); st += `left:${leftOf[c]}px;`; }
       }
+      // Rows with a fixed height in Excel clip overflowing text instead of growing
+      let allCustom = true, hsum = 0;
+      for (let y = r; y <= r2; y++) { if (!custom.has(y)) { allCustom = false; break; } if (!sh._hr.has(y)) hsum += sh.rowHeights[y]; }
+      if (allCustom && (cell.v || cell.h || edits[key] !== undefined)) { cls.push("clip"); st += `--mh:${Math.max(0, hsum - 1)}px;`; }
       const span = m ? `${m.r2 > m.r1 ? ` rowspan="${m.r2 - m.r1 + 1}"` : ""}${m.c2 > m.c1 ? ` colspan="${m.c2 - m.c1 + 1}"` : ""}` : "";
       parts.push(`<td data-r="${r}" data-c="${c}"${span} class="${cls.join(" ")}"${st ? ` style="${st}"` : ""}>${cellInner(sh, r, c, imgs[key])}</td>`);
     }
@@ -919,18 +1040,35 @@ function renderSheet() {
   S.tdMap = new Map();
   zoomEl.querySelectorAll("td").forEach((td) => S.tdMap.set(`${td.dataset.r},${td.dataset.c}`, td));
   $$("tbody th", zoomEl).forEach((th) => (th.style.left = "0px"));
-
-  if (fr) {
-    // sticky offsets for frozen rows must use the real (auto-grown) row heights
-    const rows = zoomEl.querySelectorAll("tbody tr");
-    const tops = [];
-    for (let r = 1; r <= fr; r++) tops[r] = rows[r - 1].offsetTop;
-    zoomEl.querySelectorAll("td.frz-r").forEach((td) => (td.style.top = tops[+td.dataset.r] + "px"));
-    $$("tbody th", zoomEl).slice(0, fr).forEach((th, i) => { th.style.top = tops[i + 1] + "px"; th.style.zIndex = 7; });
-  }
+  applyFreeze();
   if (sh.truncated) toast(`Large sheet: showing the first ${sh.maxRow} rows × ${sh.maxCol} columns`, "error");
   if (S.find.q) runFind(false);
   selectCell(S.cur.r, S.cur.c, false);
+}
+
+/** Frozen rows/cols from the sheet, dropped when they would fill most of the window. */
+function freezeFor(sh) {
+  let fr = sh.freeze?.r || 0, fc = sh.freeze?.c || 0;
+  const wrap = $("#gridWrap");
+  const H = wrap?.clientHeight || 700, W = wrap?.clientWidth || 1200;
+  let h = 22; for (let r = 1; r <= fr; r++) if (!sh._hr.has(r)) h += sh.rowHeights[r] || 20;
+  let w = 44; for (let c = 1; c <= fc; c++) if (!sh._hc.has(c)) w += sh.colWidths[c] || 64;
+  if (h * S.zoom > H * 0.45) fr = 0;
+  if (w * S.zoom > W * 0.55) fc = 0;
+  return { fr, fc };
+}
+/** Sticky offsets for frozen rows use the real (auto-grown) row heights. */
+function applyFreeze() {
+  const zoomEl = $("#gridZoom");
+  const sh = sheet();
+  const { fr } = freezeFor(sh);
+  zoomEl.querySelectorAll("tbody th.frz-t").forEach((th) => { th.classList.remove("frz-t"); th.style.top = ""; });
+  if (!fr) return;
+  const rows = zoomEl.querySelectorAll("tbody tr");
+  const tops = [];
+  for (let r = 1; r <= fr; r++) tops[r] = rows[r - 1].offsetTop;
+  zoomEl.querySelectorAll("td.frz-r").forEach((td) => (td.style.top = tops[+td.dataset.r] + "px"));
+  $$("tbody th", zoomEl).slice(0, fr).forEach((th, i) => { th.classList.add("frz-t"); th.style.top = tops[i + 1] + "px"; });
 }
 
 function paintCell(sheetName, r, c) {
@@ -984,17 +1122,29 @@ function selectCell(r, c, scroll = true) {
 }
 function scrollIntoView(td) {
   const wrap = $("#gridWrap");
-  const z = S.zoom;
-  const fr = sheet().freeze?.r || 0, fc = sheet().freeze?.c || 0;
-  const rowTop = td.offsetTop * z, colLeft = td.offsetLeft * z;
-  const w = td.offsetWidth * z, h = td.offsetHeight * z;
-  let stickyTop = 22 * z, stickyLeft = 44 * z;
-  if (fr && +td.dataset.r > fr) { const last = S.tdMap.get(`${fr},1`) || null; const tr = $$("tbody tr", wrap)[fr - 1]; stickyTop = (tr.offsetTop + tr.offsetHeight) * z; }
-  if (fc && +td.dataset.c > fc) { const th = $(`th[data-hc="${fc}"]`); stickyLeft = (th.offsetLeft + th.offsetWidth) * z; }
-  if (rowTop - stickyTop < wrap.scrollTop && +td.dataset.r > fr) wrap.scrollTop = rowTop - stickyTop;
-  else if (rowTop + h > wrap.scrollTop + wrap.clientHeight) wrap.scrollTop = rowTop + h - wrap.clientHeight + 8;
-  if (colLeft - stickyLeft < wrap.scrollLeft && +td.dataset.c > fc) wrap.scrollLeft = colLeft - stickyLeft;
-  else if (colLeft + Math.min(w, wrap.clientWidth - stickyLeft) > wrap.scrollLeft + wrap.clientWidth) wrap.scrollLeft = colLeft + Math.min(w, wrap.clientWidth - stickyLeft) - wrap.clientWidth + 8;
+  const wr = wrap.getBoundingClientRect();
+  const rc = td.getBoundingClientRect();
+  if (td.classList.contains("frz-r") && td.classList.contains("frz-c")) return;
+  // visible area = scroll box minus sticky headers and frozen panes (real screen pixels, any zoom)
+  let top = $("#gridZoom thead").getBoundingClientRect().bottom;
+  let left = $("#gridZoom tbody th")?.getBoundingClientRect().right ?? wr.left;
+  if (!td.classList.contains("frz-r")) {
+    const frozen = $$("#gridZoom td.frz-r");
+    if (frozen.length) top = Math.max(top, ...frozen.slice(-40).map((x) => x.getBoundingClientRect().bottom));
+  }
+  if (!td.classList.contains("frz-c")) {
+    const fh = $$("#gridZoom thead th.frz-h");
+    if (fh.length) left = Math.max(left, fh[fh.length - 1].getBoundingClientRect().right);
+  }
+  const bottom = wr.top + wrap.clientHeight, right = wr.left + wrap.clientWidth;
+  if (!td.classList.contains("frz-r")) {
+    if (rc.top < top) wrap.scrollTop -= top - rc.top + 2;
+    else if (rc.bottom > bottom) wrap.scrollTop += Math.min(rc.bottom - bottom + 6, rc.top - top);
+  }
+  if (!td.classList.contains("frz-c")) {
+    if (rc.left < left) wrap.scrollLeft -= left - rc.left + 2;
+    else if (rc.right > right) wrap.scrollLeft += Math.min(rc.right - right + 6, rc.left - left);
+  }
 }
 function move(dr, dc) {
   const sh = sheet();
@@ -1497,6 +1647,11 @@ document.addEventListener("keydown", (e) => {
   if (mod && e.key.toLowerCase() === "s") { e.preventDefault(); if (!readOnly()) saveDialog(); }
   if (mod && e.key.toLowerCase() === "f") { e.preventDefault(); $("#findInput").focus(); $("#findInput").select(); }
 });
+let resizeT;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { if (S.doc && $("#gridZoom table")) { if (S.zoomMode === "fit") setZoom(fitZoom(), "fit"); else applyFreeze(); } }, 150);
+});
 window.addEventListener("beforeunload", (e) => {
   if (S.doc && pendingCount()) { saveDraft(); e.preventDefault(); e.returnValue = ""; }
 });
@@ -1508,7 +1663,7 @@ document.addEventListener("mousedown", (e) => {
 (async function boot() {
   paintUser();
   $("#userBtn").addEventListener("click", () => askUser(true));
-  bindPicker();
+  try { const w = localStorage.getItem("dochub:sidebar"); if (w) document.documentElement.style.setProperty("--sidebar", w); } catch (_) { /* ignore */ }
   bindSearch();
   try { await loadTree(); } catch (err) {
     $("#main").innerHTML = `<div class="page"><div class="empty-state"><div class="big">${I.alert}</div><h3>Cannot reach the DocHub server</h3><p>${esc(err.message)}</p></div></div>`;

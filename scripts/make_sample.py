@@ -370,6 +370,7 @@ def _logo():
 
 def dvp_workbook(project):
     wb = Workbook()
+    wb.properties.creator = wb.properties.lastModifiedBy = "Validation Team"
     ws = wb.active
     ws.title = "DVP Plan"
     ws.sheet_view.showGridLines = False
@@ -427,6 +428,7 @@ def build(root: Path):
                 d = root / model / milestone / variant
                 d.mkdir(parents=True, exist_ok=True)
                 wb = Workbook()
+                wb.properties.creator = wb.properties.lastModifiedBy = ["Vehicle Integration", "Energy Mgmt", "VPS Team"][seed % 3]
                 vps_sheet(wb, model, variant.replace("_", " _ "), seed)
                 wb.save(d / f"VPS Input Sheet - {model} {variant}.xlsx")
                 if seed % 2:

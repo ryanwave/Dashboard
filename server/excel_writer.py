@@ -301,7 +301,37 @@ def _drop_calc_chain(files: dict):
     files["xl/_rels/workbook.xml.rels"] = etree.tostring(rels, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
-def apply_edits(src_bytes: bytes, edits: dict) -> bytes:
+_CP = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+_DCT = "http://purl.org/dc/terms/"
+
+
+def _patch_core(xml: bytes, user: str) -> bytes:
+    """Record who/when in docProps/core.xml, as Excel does (File → Info)."""
+    root = etree.fromstring(xml, parser=_PARSER)
+    who = root.find(f"{{{_CP}}}lastModifiedBy")
+    if who is None:
+        who = etree.SubElement(root, f"{{{_CP}}}lastModifiedBy")
+    who.text = _ILLEGAL.sub("", user)
+    when = root.find(f"{{{_DCT}}}modified")
+    if when is not None:
+        when.text = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+def read_core(zf: zipfile.ZipFile) -> dict:
+    """lastModifiedBy / modified / creator from docProps/core.xml (may be empty)."""
+    try:
+        root = etree.fromstring(zf.read("docProps/core.xml"), parser=_PARSER)
+    except Exception:
+        return {}
+    def text(ns, tag):
+        el = root.find(f"{{{ns}}}{tag}")
+        return (el.text or "").strip() if el is not None and el.text else ""
+    return {"lastModifiedBy": text(_CP, "lastModifiedBy"), "modified": text(_DCT, "modified"),
+            "creator": text("http://purl.org/dc/elements/1.1/", "creator")}
+
+
+def apply_edits(src_bytes: bytes, edits: dict, user: str | None = None) -> bytes:
     """edits: {sheet_name: {(row, col): typed value}} -> new xlsx bytes."""
     zin = zipfile.ZipFile(io.BytesIO(src_bytes))
     infos = zin.infolist()
@@ -320,6 +350,11 @@ def apply_edits(src_bytes: bytes, edits: dict) -> bytes:
         files["xl/workbook.xml"] = _patch_workbook(files["xl/workbook.xml"])
         if "xl/calcChain.xml" in files:
             _drop_calc_chain(files)
+        if user and "docProps/core.xml" in files:
+            try:
+                files["docProps/core.xml"] = _patch_core(files["docProps/core.xml"], user)
+            except Exception:
+                pass
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
         for info in infos:
