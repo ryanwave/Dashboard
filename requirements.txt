@@ -1,6 +1,5 @@
+# Pure-Python packages only: nothing here ships a compiled DLL, so DocHub also
+# runs on PCs where IT's Application Control policy blocks add-on DLLs.
 flask>=3.0
 openpyxl>=3.1
-lxml>=4.9
 waitress>=2.1
-pillow>=10.0
-pywin32>=306; sys_platform == "win32"

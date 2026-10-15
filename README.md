@@ -96,8 +96,8 @@ python -m pytest -q
 | Part | File | Notes |
 |---|---|---|
 | Web server / REST API | `server/app.py` | Flask, served by Waitress in production |
-| Excel → web model | `server/excel_reader.py` | openpyxl; resolves theme colours, borders, merges, images, validations |
-| Web edits → Excel | `server/excel_writer.py` | Patches only the edited `<c>` cells in the sheet XML (lxml) |
+| Excel → web model | `server/excel_reader.py` | openpyxl + Python's built-in XML parser (no compiled DLLs); resolves theme colours, borders, merges, images, validations |
+| Web edits → Excel | `server/excel_writer.py` | Rewrites only the edited cells' XML text; the rest of the file stays byte-identical |
 | History & audit | `server/storage.py` | JSON revision log + full snapshot per revision under `.dochub/` |
 | Front end | `static/` | Plain HTML/CSS/JS with no build step and no internet/CDN needed |
 
@@ -109,8 +109,9 @@ python -m pytest -q
 
 | Message | What to do |
 |---|---|
-| **Old Excel format** (.xls / .xlsb) | Click **Convert to .xlsx**. This needs Excel on the server PC (plus `pip install pywin32`) or LibreOffice. Otherwise, open the file in Excel and use Save As → *Excel Workbook (.xlsx)*. The original file is kept. |
+| **Old Excel format** (.xls / .xlsb) | Click **Convert to .xlsx**. This needs Excel on the server PC plus the optional `pip install pywin32` (which some IT policies block), or LibreOffice. Otherwise, open the file in Excel and use Save As → *Excel Workbook (.xlsx)*. The original file is kept. |
 | **This workbook is protected** | The file is encrypted by a password or a Microsoft sensitivity label such as "Confidential – encrypted". Save a copy without encryption, or ask IT for a label that does not encrypt. |
+| **Startup error: "DLL load failed … Application Control policy has blocked this file"** | Your IT policy blocks compiled add-ons. DocHub no longer needs any. Pull the latest version and run `python -m pip uninstall -y lxml pillow`. |
 | **The file is in use / could not be read** | Close it in Excel, or make the OneDrive folder "Always keep on this device". |
 
 Documents are found in Variant folders, including their sub-folders, and also

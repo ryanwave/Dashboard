@@ -11,12 +11,13 @@ import base64
 import colorsys
 import datetime as dt
 import html
+import posixpath
 import re
 import threading
 import zipfile
 from collections import OrderedDict
 
-from lxml import etree
+import xml.etree.ElementTree as ET
 from openpyxl import load_workbook
 from openpyxl.cell.rich_text import CellRichText, TextBlock
 from openpyxl.styles.colors import COLOR_INDEX
@@ -40,19 +41,23 @@ DEFAULT_THEME = [
 # --------------------------------------------------------------------------
 # Colours
 # --------------------------------------------------------------------------
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
 def parse_theme(xml_bytes) -> list[str]:
     if not xml_bytes:
         return list(DEFAULT_THEME)
     try:
-        root = etree.fromstring(xml_bytes)
+        root = ET.fromstring(xml_bytes)
         scheme = root.find(f".//{_A}clrScheme")
         found = {}
         for child in scheme:
-            name = etree.QName(child).localname
+            name = _local(child.tag)
             if not len(child):
                 continue
             el = child[0]
-            kind = etree.QName(el).localname
+            kind = _local(el.tag)
             if kind == "srgbClr":
                 found[name] = el.get("val")
             elif kind == "sysClr":
@@ -387,7 +392,7 @@ def row_height_px(points: float) -> int:
     return int(round(points * 96 / 72))
 
 
-def _used_range(ws):
+def _used_range(ws, images=()):
     """Rows/cols that actually matter: values, merges and images, plus any
     formatted-only cells close to them (whole-column formatting that runs
     thousands of rows past the data is ignored)."""
@@ -407,13 +412,9 @@ def _used_range(ws):
                 sty_r, sty_c = max(sty_r, r), max(sty_c, c)
     for mr in ws.merged_cells.ranges:
         val_r, val_c = max(val_r, mr.max_row), max(val_c, mr.max_col)
-    for img in getattr(ws, "_images", []):
-        try:
-            anc = img.anchor
-            to = getattr(anc, "to", None) or anc._from
-            val_r, val_c = max(val_r, to.row + 1), max(val_c, to.col + 1)
-        except Exception:
-            pass
+    for img in images:
+        end = img.get("to") or img
+        val_r, val_c = max(val_r, end["r"]), max(val_c, end["c"])
     max_r = max(val_r, min(sty_r, val_r + 40))
     max_c = max(val_c, min(sty_c, val_c + 10))
     return max(1, max_r), max(1, max_c)
@@ -455,38 +456,88 @@ def _validations(ws, wb) -> dict:
     return out
 
 
-def _images(ws) -> list:
-    imgs = []
-    for img in getattr(ws, "_images", []):
-        try:
-            data = img._data()
-            fmt = (img.format or "png").lower()
-            mime = "image/jpeg" if fmt in ("jpg", "jpeg") else f"image/{fmt}"
-            anc = img.anchor
-            frm = anc._from
-            item = {
-                "src": f"data:{mime};base64,{base64.b64encode(data).decode()}",
-                "r": frm.row + 1, "c": frm.col + 1,
-                "dx": round(frm.colOff / 9525), "dy": round(frm.rowOff / 9525),
-            }
-            to = getattr(anc, "to", None)
-            ext = getattr(anc, "ext", None)
-            if to is not None:
-                item["to"] = {"r": to.row + 1, "c": to.col + 1,
-                              "dx": round(to.colOff / 9525), "dy": round(to.rowOff / 9525)}
-            elif ext is not None:
-                item["w"] = round(ext.width / 9525)
-                item["h"] = round(ext.height / 9525)
-            else:
-                item["w"], item["h"] = img.width, img.height
-            imgs.append(item)
-        except Exception:
+_XDR = "{http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing}"
+_DML = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_RID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_IMG_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+             ".bmp": "image/bmp", ".svg": "image/svg+xml", ".webp": "image/webp"}
+
+
+def _rels(z, part: str) -> dict:
+    """{rId: (absolute target, type)} for a package part."""
+    folder, name = posixpath.split(part)
+    rel_path = posixpath.join(folder, "_rels", name + ".rels")
+    try:
+        root = ET.fromstring(z.read(rel_path))
+    except KeyError:
+        return {}
+    out = {}
+    for r in root:
+        target = r.get("Target") or ""
+        if r.get("TargetMode") == "External":
             continue
-    return imgs
+        full = target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join(folder, target))
+        out[r.get("Id")] = (full, r.get("Type") or "")
+    return out
 
 
-def sheet_model(ws, cached, wb, theme) -> dict:
-    max_r, max_c = _used_range(ws)
+def images_by_sheet(path) -> dict:
+    """{sheet: [image anchors]} read directly from the .xlsx (logos, signatures…).
+
+    Formats a browser cannot display (EMF/WMF) are skipped; they are still
+    kept untouched in the file when it is saved.
+    """
+    from .excel_writer import _sheet_paths
+
+    out = {}
+    with zipfile.ZipFile(path) as z:
+        names = set(z.namelist())
+        for sheet, part in _sheet_paths(z).items():
+            imgs = []
+            for drawing, rtype in _rels(z, part).values():
+                if not rtype.endswith("/drawing") or drawing not in names:
+                    continue
+                media = _rels(z, drawing)
+                root = ET.fromstring(z.read(drawing))
+                for anc in root:
+                    kind = _local(anc.tag)
+                    if kind not in ("twoCellAnchor", "oneCellAnchor"):
+                        continue
+                    blip = anc.find(f".//{_XDR}pic//{_DML}blip")
+                    if blip is None:
+                        continue
+                    target = media.get(blip.get(f"{_RID}embed"), (None, ""))[0]
+                    mime = _IMG_MIME.get(posixpath.splitext(target or "")[1].lower())
+                    if not target or not mime or target not in names:
+                        continue
+
+                    def pos(el):
+                        n = lambda t: int(float(el.findtext(f"{_XDR}{t}") or 0))  # noqa: E731
+                        return {"r": n("row") + 1, "c": n("col") + 1,
+                                "dx": round(n("colOff") / 9525), "dy": round(n("rowOff") / 9525)}
+
+                    frm = anc.find(f"{_XDR}from")
+                    if frm is None:
+                        continue
+                    item = pos(frm)
+                    item["src"] = f"data:{mime};base64,{base64.b64encode(z.read(target)).decode()}"
+                    to = anc.find(f"{_XDR}to")
+                    ext = anc.find(f"{_XDR}ext")
+                    if kind == "twoCellAnchor" and to is not None:
+                        t = pos(to)
+                        item["to"] = {"r": t["r"], "c": t["c"], "dx": t["dx"], "dy": t["dy"]}
+                    elif ext is not None:
+                        item["w"] = round(int(ext.get("cx", 0)) / 9525)
+                        item["h"] = round(int(ext.get("cy", 0)) / 9525)
+                    else:
+                        continue
+                    imgs.append(item)
+            out[sheet] = imgs
+    return out
+
+
+def sheet_model(ws, cached, wb, theme, images=()) -> dict:
+    max_r, max_c = _used_range(ws, images)
     truncated = max_r > MAX_ROWS or max_c > MAX_COLS
     max_r, max_c = min(max_r, MAX_ROWS), min(max_c, MAX_COLS)
 
@@ -641,7 +692,7 @@ def sheet_model(ws, cached, wb, theme) -> dict:
         "merges": merges,
         "cells": cells,
         "styles": list(style_index.keys()),
-        "images": _images(ws),
+        "images": list(images),
         "validations": _validations(ws, wb),
         "gridLines": bool(view.showGridLines) if view.showGridLines is not None else True,
         "zoom": int(view.zoomScale or 100),
@@ -679,7 +730,12 @@ def formula_cache(path: str) -> dict:
                 continue
             vals = {}
             with z.open(part) as fh:
-                for _, el in etree.iterparse(fh, tag=f"{_SML}c", resolve_entities=False, huge_tree=True):
+                for _, el in ET.iterparse(fh):
+                    if el.tag == f"{_SML}row":
+                        el.clear()
+                        continue
+                    if el.tag != f"{_SML}c":
+                        continue
                     if el.find(f"{_SML}f") is not None:
                         v = el.find(f"{_SML}v")
                         m = _REF.match(el.get("r") or "")
@@ -720,10 +776,14 @@ def read_workbook(path: str, cache_key=None) -> dict:
         cache = formula_cache(path)
     except Exception:
         cache = {}
+    try:
+        images = images_by_sheet(path)
+    except Exception:
+        images = {}
     theme = parse_theme(getattr(wb, "loaded_theme", None))
     sheets = []
     for ws in wb.worksheets:
-        sheets.append(sheet_model(ws, cache.get(ws.title, {}), wb, theme))
+        sheets.append(sheet_model(ws, cache.get(ws.title, {}), wb, theme, images.get(ws.title, [])))
     active = wb.active.title if wb.active is not None else (sheets[0]["name"] if sheets else None)
     model = {"sheets": sheets, "active": active}
     if cache_key is not None:

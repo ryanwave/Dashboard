@@ -7,12 +7,13 @@ Only the edited <c> elements (plus calc settings) are rewritten.
 from __future__ import annotations
 
 import datetime as dt
+import html
 import io
 import posixpath
 import re
+import xml.etree.ElementTree as ET
 import zipfile
 
-from lxml import etree
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.utils.datetime import to_excel
@@ -28,7 +29,6 @@ def q(tag: str) -> str:
     return f"{{{NS}}}{tag}"
 
 
-_PARSER = etree.XMLParser(resolve_entities=False, huge_tree=True, remove_blank_text=False)
 _ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _REF = re.compile(r"([A-Z]+)(\d+)")
 
@@ -100,10 +100,19 @@ def coerce(text, original, number_format: str | None):
 
 # --------------------------------------------------------------------------
 # Package helpers
+#
+# Only Python's standard library is used here (no lxml): some corporate PCs
+# block compiled add-on DLLs. Reading uses xml.etree; writing edits the XML
+# *text* of the affected cells only, so every other byte of the file — and
+# every namespace prefix Excel relies on — stays exactly as it was.
 # --------------------------------------------------------------------------
+def _xml(data: bytes):
+    return ET.fromstring(data)
+
+
 def _sheet_paths(zf: zipfile.ZipFile) -> dict:
-    wb = etree.fromstring(zf.read("xl/workbook.xml"), parser=_PARSER)
-    rels = etree.fromstring(zf.read("xl/_rels/workbook.xml.rels"), parser=_PARSER)
+    wb = _xml(zf.read("xl/workbook.xml"))
+    rels = _xml(zf.read("xl/_rels/workbook.xml.rels"))
     targets = {r.get("Id"): r.get("Target") for r in rels}
     out = {}
     sheets = wb.find(q("sheets"))
@@ -120,34 +129,24 @@ def _sheet_paths(zf: zipfile.ZipFile) -> dict:
     return out
 
 
-def _set_value(c, value):
-    for child in list(c):
-        if etree.QName(child).localname in ("f", "v", "is"):
-            c.remove(child)
-    c.attrib.pop("t", None)
-    ext = [ch for ch in c if etree.QName(ch).localname == "extLst"]
-    for e in ext:
-        c.remove(e)
-    if value is None:
-        pass
-    elif isinstance(value, Formula):
-        f = etree.SubElement(c, q("f"))
-        f.text = _ILLEGAL.sub("", value[1:])
-    elif isinstance(value, bool):
-        c.set("t", "b")
-        etree.SubElement(c, q("v")).text = "1" if value else "0"
-    elif isinstance(value, (int, float)):
-        etree.SubElement(c, q("v")).text = repr(value) if isinstance(value, float) else str(value)
-    elif isinstance(value, (dt.datetime, dt.date)):
-        etree.SubElement(c, q("v")).text = repr(float(to_excel(value)))
-    else:
-        c.set("t", "inlineStr")
-        is_ = etree.SubElement(c, q("is"))
-        t = etree.SubElement(is_, q("t"))
-        t.text = _ILLEGAL.sub("", str(value))
-        t.set(XML_SPACE, "preserve")
-    for e in ext:
-        c.append(e)
+def _esc(text: str) -> str:
+    text = _ILLEGAL.sub("", str(text))
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _decode(xml: bytes):
+    if xml[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return xml.decode("utf-16"), "utf-16"
+    return xml.decode("utf-8-sig" if xml[:3] == b"\xef\xbb\xbf" else "utf-8"), "utf-8"
+
+
+def _attr(attrs: str, name: str):
+    m = re.search(r'(?:^|\s)' + re.escape(name) + r'\s*=\s*(["\'])(.*?)\1', attrs, re.S)
+    return html.unescape(m.group(2)) if m else None
+
+
+def _without_attr(attrs: str, name: str) -> str:
+    return re.sub(r'\s+' + re.escape(name) + r'\s*=\s*(["\']).*?\1', "", attrs, flags=re.S)
 
 
 def _in_ref(ref: str, r: int, c: int) -> bool:
@@ -158,115 +157,160 @@ def _in_ref(ref: str, r: int, c: int) -> bool:
     return min_r <= r <= max_r and min_c <= c <= max_c
 
 
-def _prepare_formulas(sheet_data, edits: dict):
-    """Keep shared / array formulas valid when edited cells take part in them.
-
-    Excel stores a column of similar formulas as one "shared" formula whose text
-    lives only in the first (master) cell. If that master cell is overwritten,
-    every other cell of the group is rewritten with its own explicit formula.
-    """
-    groups, masters = {}, {}
-    for c in sheet_data.iter(q("c")):
-        f = c.find(q("f"))
-        if f is None:
-            continue
-        ref = c.get("r")
-        m = _REF.match(ref or "")
-        if not m:
-            continue
-        rc = (int(m.group(2)), col_index(m.group(1)))
-        if f.get("t") == "shared" and f.get("si") is not None:
-            groups.setdefault(f.get("si"), []).append((rc, c, f))
-            if f.text:
-                masters[f.get("si")] = (rc, ref, f.text)
-        elif f.get("t") == "array" and f.get("ref"):
-            for (r, cc) in edits:
-                if (r, cc) != rc and _in_ref(f.get("ref"), r, cc):
-                    raise EditError(f"Cell {get_column_letter(cc)}{r} is part of an array formula "
-                                    f"({f.get('ref')}) and can only be changed in Excel.")
-    for si, (mrc, mref, text) in masters.items():
-        if mrc not in edits:
-            continue
-        for rc, c, f in groups.get(si, []):
-            if rc == mrc or rc in edits:
-                continue
-            try:
-                new = Translator("=" + text, origin=mref).translate_formula(c.get("r"))[1:]
-            except Exception:
-                new = text
-            for attr in ("t", "si", "ref"):
-                f.attrib.pop(attr, None)
-            f.text = new
+def _cell_xml(p: str, ref: str, style, value) -> str:
+    s = f' s="{style}"' if style else ""
+    if value is None:
+        return f'<{p}c r="{ref}"{s}/>'
+    if isinstance(value, Formula):
+        return f'<{p}c r="{ref}"{s}><{p}f>{_esc(value[1:])}</{p}f></{p}c>'
+    if isinstance(value, bool):
+        return f'<{p}c r="{ref}"{s} t="b"><{p}v>{1 if value else 0}</{p}v></{p}c>'
+    if isinstance(value, (int, float)):
+        return f'<{p}c r="{ref}"{s}><{p}v>{repr(value) if isinstance(value, float) else value}</{p}v></{p}c>'
+    if isinstance(value, (dt.datetime, dt.date)):
+        return f'<{p}c r="{ref}"{s}><{p}v>{repr(float(to_excel(value)))}</{p}v></{p}c>'
+    return (f'<{p}c r="{ref}"{s} t="inlineStr"><{p}is><{p}t xml:space="preserve">{_esc(value)}'
+            f'</{p}t></{p}is></{p}c>')
 
 
 def _patch_sheet(xml: bytes, edits: dict) -> bytes:
-    """edits: {(row, col): value}"""
-    root = etree.fromstring(xml, parser=_PARSER)
-    sheet_data = root.find(q("sheetData"))
-    _prepare_formulas(sheet_data, edits)
-    col_styles = {}
-    cols = root.find(q("cols"))
-    if cols is not None:
-        for col in cols:
-            if col.get("style"):
-                for i in range(int(col.get("min")), int(col.get("max")) + 1):
-                    col_styles[i] = col.get("style")
+    """edits: {(row, col): value} -> patched sheet XML (bytes)."""
+    text, enc = _decode(xml)
+    m = re.search(r'<(?:([A-Za-z_][\w.\-]*):)?sheetData\b([^>]*?)(/?)>', text)
+    if not m:
+        raise EditError("The sheet has no cell data section and cannot be edited here.")
+    p = m.group(1) + ":" if m.group(1) else ""
+    if m.group(3) == "/":  # <sheetData/> — an empty sheet
+        text = text[:m.start()] + f"<{p}sheetData{m.group(2)}></{p}sheetData>" + text[m.end():]
+        m = re.search(r'<(?:[A-Za-z_][\w.\-]*:)?sheetData\b[^>]*>', text)
+    body_start = m.end()
+    body_end = text.index(f"</{p}sheetData>", body_start)
+    body = text[body_start:body_end]
 
-    rows = {}
-    implicit = 0
-    for row in sheet_data.findall(q("row")):
-        idx = int(row.get("r")) if row.get("r") else implicit + 1
-        row.set("r", str(idx))
-        implicit = idx
-        rows[idx] = row
+    pe = re.escape(p)
+    row_re = re.compile(r'<' + pe + r'row\b([^>]*?)(/>|>(.*?)</' + pe + r'row>)', re.S)
+    cell_re = re.compile(r'<' + pe + r'c\b([^>]*?)(/>|>(.*?)</' + pe + r'c>)', re.S)
+    f_re = re.compile(r'<' + pe + r'f\b([^>]*?)(/>|>(.*?)</' + pe + r'f>)', re.S)
 
-    for (r, c), value in sorted(edits.items()):
-        row = rows.get(r)
-        if row is None:
-            row = etree.Element(q("row"))
-            row.set("r", str(r))
-            later = [k for k in rows if k > r]
-            if later:
-                rows[min(later)].addprevious(row)
-            else:
-                sheet_data.append(row)
-            rows[r] = row
-        row.attrib.pop("spans", None)
-        ref = f"{get_column_letter(c)}{r}"
-        target, before = None, None
-        implicit_c = 0
-        for cell in row.findall(q("c")):
-            if cell.get("r"):
-                m = _REF.match(cell.get("r"))
-                ci = col_index(m.group(1)) if m else implicit_c + 1
-            else:
-                ci = implicit_c + 1
-                cell.set("r", f"{get_column_letter(ci)}{r}")
-            implicit_c = ci
-            if ci == c:
-                target = cell
-                break
-            if ci > c:
-                before = cell
-                break
-        if target is None:
-            if value is None:
+    # -- shared / array formulas -------------------------------------------
+    groups, masters = {}, {}
+    for cm in cell_re.finditer(body):
+        inner = cm.group(3) or ""
+        fm = f_re.search(inner)
+        if not fm:
+            continue
+        ref = _attr(cm.group(1), "r") or ""
+        rm = _REF.match(ref)
+        if not rm:
+            continue
+        rc = (int(rm.group(2)), col_index(rm.group(1)))
+        ft, si = _attr(fm.group(1), "t"), _attr(fm.group(1), "si")
+        if ft == "shared" and si is not None:
+            groups.setdefault(si, []).append((rc, ref))
+            if fm.group(3):
+                masters[si] = (rc, ref, html.unescape(fm.group(3)))
+        elif ft == "array" and _attr(fm.group(1), "ref"):
+            aref = _attr(fm.group(1), "ref")
+            for (r, c) in edits:
+                if (r, c) != rc and _in_ref(aref, r, c):
+                    raise EditError(f"Cell {get_column_letter(c)}{r} is part of an array formula "
+                                    f"({aref}) and can only be changed in Excel.")
+    # Excel keeps a column of similar formulas as one "shared" formula whose
+    # text lives only in the first (master) cell. If that cell is overwritten,
+    # the other cells of the group get their own explicit formula.
+    new_formula = {}
+    for si, (mrc, mref, ftext) in masters.items():
+        if mrc not in edits:
+            continue
+        for rc, ref in groups.get(si, []):
+            if rc == mrc or rc in edits:
                 continue
-            target = etree.Element(q("c"))
-            target.set("r", ref)
-            style = row.get("s") if row.get("customFormat") in ("1", "true") else col_styles.get(c)
-            if style:
-                target.set("s", style)
-            if before is not None:
-                before.addprevious(target)
-            else:
-                ext = row.find(q("extLst"))
-                if ext is not None:
-                    ext.addprevious(target)
-                else:
-                    row.append(target)
-        _set_value(target, value)
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+            try:
+                new_formula[rc] = Translator("=" + ftext, origin=mref).translate_formula(ref)[1:]
+            except Exception:
+                new_formula[rc] = ftext
+
+    # -- default styles for brand-new cells --------------------------------
+    col_styles = {}
+    for colm in re.finditer(r'<' + pe + r'col\b([^>]*?)/?>', text[:m.start()]):
+        st, lo, hi = _attr(colm.group(1), "style"), _attr(colm.group(1), "min"), _attr(colm.group(1), "max")
+        if st and lo and hi:
+            for i in range(int(lo), min(int(hi), 16384) + 1):
+                col_styles[i] = st
+
+    by_row = {}
+    for (r, c), v in edits.items():
+        by_row.setdefault(r, {})[c] = v
+    for (r, c) in new_formula:
+        by_row.setdefault(r, {})
+
+    def patch_row(rnum, attrs, inner):
+        cell_edits = by_row.get(rnum, {})
+        row_style = _attr(attrs, "s") if _attr(attrs, "customFormat") in ("1", "true") else None
+        attrs = _without_attr(attrs, "spans")
+        if _attr(attrs, "r") is None:
+            attrs = f' r="{rnum}"' + attrs
+        out, pos, implicit = [], 0, 0
+        pending = sorted(cell_edits)
+
+        def new_cells(upto):
+            while pending and pending[0] < upto:
+                c = pending.pop(0)
+                if cell_edits[c] is not None:
+                    out.append(_cell_xml(p, f"{get_column_letter(c)}{rnum}", row_style or col_styles.get(c), cell_edits[c]))
+
+        for cm in cell_re.finditer(inner):
+            cattrs = cm.group(1)
+            ref = _attr(cattrs, "r")
+            rm = _REF.match(ref or "")
+            ci = col_index(rm.group(1)) if rm else implicit + 1
+            implicit = ci
+            out.append(inner[pos:cm.start()])
+            pos = cm.end()
+            new_cells(ci)
+            cell = cm.group(0)
+            if not rm:  # give implicit cells an explicit address before inserting others
+                cell = f"<{p}c r=\"{get_column_letter(ci)}{rnum}\"" + cell[len(p) + 2:]
+            if ci in cell_edits:
+                if pending and pending[0] == ci:
+                    pending.pop(0)
+                cell = _cell_xml(p, f"{get_column_letter(ci)}{rnum}", _attr(cattrs, "s"), cell_edits[ci])
+            elif (rnum, ci) in new_formula:
+                cell = f_re.sub(lambda _: f"<{p}f>{_esc(new_formula[(rnum, ci)])}</{p}f>", cell, count=1)
+            out.append(cell)
+        rest = inner[pos:]
+        ext = re.search(r'<' + pe + r'extLst\b', rest)
+        if ext:
+            out.append(rest[:ext.start()])
+            new_cells(1 << 30)
+            out.append(rest[ext.start():])
+        else:
+            new_cells(1 << 30)
+            out.append(rest)
+        return f"<{p}row{attrs}>" + "".join(out) + f"</{p}row>"
+
+    out, pos, implicit = [], 0, 0
+    todo = sorted(by_row)
+    for rm in row_re.finditer(body):
+        rattrs = rm.group(1)
+        rnum = int(_attr(rattrs, "r") or implicit + 1)
+        implicit = rnum
+        while todo and todo[0] < rnum:  # rows that do not exist yet
+            r = todo.pop(0)
+            if any(v is not None for v in by_row[r].values()):
+                out.append(body[pos:rm.start()])
+                pos = rm.start()
+                out.append(patch_row(r, f' r="{r}"', ""))
+        if todo and todo[0] == rnum:
+            todo.pop(0)
+            out.append(body[pos:rm.start()])
+            out.append(patch_row(rnum, rattrs, rm.group(3) or ""))
+            pos = rm.end()
+    out.append(body[pos:])
+    for r in todo:
+        if any(v is not None for v in by_row[r].values()):
+            out.append(patch_row(r, f' r="{r}"', ""))
+    return (text[:body_start] + "".join(out) + text[body_end:]).encode(enc)
 
 
 _CALC_AFTER = ["oleSize", "customWorkbookViews", "pivotCaches", "smartTagPr", "smartTagTypes",
@@ -274,31 +318,40 @@ _CALC_AFTER = ["oleSize", "customWorkbookViews", "pivotCaches", "smartTagPr", "s
 
 
 def _patch_workbook(xml: bytes) -> bytes:
-    root = etree.fromstring(xml, parser=_PARSER)
-    calc = root.find(q("calcPr"))
-    if calc is None:
-        calc = etree.Element(q("calcPr"))
-        anchor = next((root.find(q(t)) for t in _CALC_AFTER if root.find(q(t)) is not None), None)
-        if anchor is not None:
-            anchor.addprevious(calc)
+    """Ask Excel to recalculate all formulas when the file is next opened."""
+    text, enc = _decode(xml)
+    pm = re.search(r'<(?:([A-Za-z_][\w.\-]*):)?workbook\b', text)
+    p = pm.group(1) + ":" if pm and pm.group(1) else ""
+    pe = re.escape(p)
+    cm = re.search(r'<' + pe + r'calcPr\b([^>]*?)(/?)>', text)
+    if cm:
+        attrs = cm.group(1)
+        if re.search(r'\sfullCalcOnLoad\s*=', attrs):
+            attrs = re.sub(r'(\sfullCalcOnLoad\s*=\s*)(["\']).*?\2', r'\1"1"', attrs)
         else:
-            root.append(calc)
-    calc.set("fullCalcOnLoad", "1")
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+            attrs += ' fullCalcOnLoad="1"'
+        text = text[:cm.start()] + f"<{p}calcPr{attrs}{cm.group(2)}>" + text[cm.end():]
+    else:
+        insert = f'<{p}calcPr fullCalcOnLoad="1"/>'
+        for tag in _CALC_AFTER:
+            am = re.search(r'<' + pe + tag + r'\b', text)
+            if am:
+                text = text[:am.start()] + insert + text[am.start():]
+                break
+        else:
+            end = text.rindex(f"</{p}workbook>")
+            text = text[:end] + insert + text[end:]
+    return text.encode(enc)
 
 
 def _drop_calc_chain(files: dict):
     files.pop("xl/calcChain.xml", None)
-    ct = etree.fromstring(files["[Content_Types].xml"])
-    for o in list(ct):
-        if o.get("PartName") == "/xl/calcChain.xml":
-            ct.remove(o)
-    files["[Content_Types].xml"] = etree.tostring(ct, xml_declaration=True, encoding="UTF-8", standalone=True)
-    rels = etree.fromstring(files["xl/_rels/workbook.xml.rels"])
-    for r in list(rels):
-        if (r.get("Type") or "").endswith("/calcChain"):
-            rels.remove(r)
-    files["xl/_rels/workbook.xml.rels"] = etree.tostring(rels, xml_declaration=True, encoding="UTF-8", standalone=True)
+    ct, enc = _decode(files["[Content_Types].xml"])
+    ct = re.sub(r'<(?:[\w.\-]+:)?Override\b[^>]*PartName\s*=\s*"/xl/calcChain\.xml"[^>]*/>', "", ct)
+    files["[Content_Types].xml"] = ct.encode(enc)
+    rels, enc = _decode(files["xl/_rels/workbook.xml.rels"])
+    rels = re.sub(r'<(?:[\w.\-]+:)?Relationship\b[^>]*Type\s*=\s*"[^"]*/calcChain"[^>]*/>', "", rels)
+    files["xl/_rels/workbook.xml.rels"] = rels.encode(enc)
 
 
 _CP = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
@@ -307,23 +360,32 @@ _DCT = "http://purl.org/dc/terms/"
 
 def _patch_core(xml: bytes, user: str) -> bytes:
     """Record who/when in docProps/core.xml, as Excel does (File → Info)."""
-    root = etree.fromstring(xml, parser=_PARSER)
-    who = root.find(f"{{{_CP}}}lastModifiedBy")
-    if who is None:
-        who = etree.SubElement(root, f"{{{_CP}}}lastModifiedBy")
-    who.text = _ILLEGAL.sub("", user)
-    when = root.find(f"{{{_DCT}}}modified")
-    if when is not None:
-        when.text = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    text, enc = _decode(xml)
+    pm = re.search(r'xmlns:([\w.\-]+)\s*=\s*"' + re.escape(_CP) + '"', text)
+    cp = pm.group(1) + ":" if pm else ""
+    who = f"<{cp}lastModifiedBy>{_esc(user)}</{cp}lastModifiedBy>"
+    lm = re.search(r'<' + re.escape(cp) + r'lastModifiedBy\b[^>]*?(/>|>.*?</' + re.escape(cp) + r'lastModifiedBy>)', text, re.S)
+    if lm:
+        text = text[:lm.start()] + who + text[lm.end():]
+    else:
+        end = re.search(r'</(?:[\w.\-]+:)?coreProperties>', text)
+        if end:
+            text = text[:end.start()] + who + text[end.start():]
+    dm = re.search(r'xmlns:([\w.\-]+)\s*=\s*"' + re.escape(_DCT) + '"', text)
+    if dm:
+        d = re.escape(dm.group(1) + ":")
+        now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        text = re.sub(r'(<' + d + r'modified\b[^>]*>).*?(</' + d + r'modified>)', lambda x: x.group(1) + now + x.group(2), text, count=1, flags=re.S)
+    return text.encode(enc)
 
 
 def read_core(zf: zipfile.ZipFile) -> dict:
     """lastModifiedBy / modified / creator from docProps/core.xml (may be empty)."""
     try:
-        root = etree.fromstring(zf.read("docProps/core.xml"), parser=_PARSER)
+        root = _xml(zf.read("docProps/core.xml"))
     except Exception:
         return {}
+
     def text(ns, tag):
         el = root.find(f"{{{ns}}}{tag}")
         return (el.text or "").strip() if el is not None and el.text else ""

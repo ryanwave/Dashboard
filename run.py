@@ -5,9 +5,23 @@
     set DOCHUB_ROOT=\\\\server\\share\\Dashboard && python run.py
 """
 import argparse
+import os
 import socket
+import sys
 
-from server.app import create_app, default_root
+# Never let openpyxl load lxml: on locked-down PCs its DLL is blocked by IT policy.
+os.environ.setdefault("OPENPYXL_LXML", "False")
+
+try:
+    from server.app import create_app, default_root
+except ImportError as exc:  # a required package is missing or blocked
+    print(f"\n  DocHub could not start: {exc}\n")
+    if "DLL" in str(exc) or "policy" in str(exc).lower():
+        print("  A compiled add-on was blocked by your PC's Application Control policy.")
+        print("  DocHub does not need it. Remove it with:   python -m pip uninstall -y lxml pillow\n")
+    else:
+        print("  Install the required packages with:   python -m pip install -r requirements.txt\n")
+    sys.exit(1)
 
 
 def main():

@@ -330,7 +330,10 @@ def vps_sheet(wb, project, variant_label, seed=0):
     put(ws, f"A{r}:L{r}", "Vehicle Performance Simulation COE (Confidential)", fill_color=BLUE_MID, bold=True, size=8)
 
     # ---- Logo (images are preserved on save and shown in the web view)
-    ws.add_image(_logo(), "A1")
+    try:
+        ws.add_image(_logo(), "A1")
+    except ImportError:
+        pass  # Pillow unavailable (e.g. blocked by IT policy): the demo just has no logo
 
     # ---- Dropdown fields & notes
     dv = DataValidation(type="list", formula1='"N1,N2,N3,M1,M2"', allow_blank=True)
@@ -452,8 +455,8 @@ def store_formula_results(root: Path):
     """
     import io
     import re
+    import xml.etree.ElementTree as ET
     import zipfile
-    from lxml import etree
     ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     pat = re.compile(r"ROUND\(([A-Z]+)(\d+)\*([A-Z]+)(\d+)/3600,2\)")
     for f in root.rglob("VPS*.xlsx"):
@@ -462,26 +465,23 @@ def store_formula_results(root: Path):
         infos = zin.infolist()
         zin.close()
         name = "xl/worksheets/sheet1.xml"
-        tree = etree.fromstring(files[name])
         vals = {}
-        for c in tree.iter(f"{ns}c"):
+        for c in ET.fromstring(files[name]).iter(f"{ns}c"):
             v = c.find(f"{ns}v")
             if v is not None and v.text and c.get("t") in (None, "n"):
                 vals[c.get("r")] = float(v.text)
-        for c in tree.iter(f"{ns}c"):
-            fe = c.find(f"{ns}f")
-            if fe is None:
-                continue
-            m = pat.fullmatch(fe.text or "")
-            if not m:
-                continue
-            a = vals.get(m.group(1) + m.group(2), 0)
-            b = vals.get(m.group(3) + m.group(4), 0)
-            v = c.find(f"{ns}v")
-            if v is None:
-                v = etree.SubElement(c, f"{ns}v")
-            v.text = repr(round(a * b / 3600, 2))
-        files[name] = etree.tostring(tree, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+        def add_value(m):
+            fm = pat.fullmatch(m.group(2))
+            if not fm:
+                return m.group(0)
+            a = vals.get(fm.group(1) + fm.group(2), 0)
+            b = vals.get(fm.group(3) + fm.group(4), 0)
+            return f"{m.group(1)}<v>{round(a * b / 3600, 2)!r}</v>"
+
+        text = files[name].decode("utf-8")
+        text = re.sub(r"(<f>([^<]*)</f>)(?:<v>[^<]*</v>|<v/>)?", add_value, text)
+        files[name] = text.encode("utf-8")
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
             for info in infos:

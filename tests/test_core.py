@@ -203,3 +203,47 @@ def test_edited_by_uses_excel_author_then_dochub_user(root):
 def test_column_width_matches_excel():
     assert excel_reader.col_width_px(9.140625) == 64   # Excel default column
     assert excel_reader.col_width_px(30) == 210
+
+
+def test_runs_when_compiled_addons_are_blocked(tmp_path):
+    """Corporate Application Control policies can block DLLs such as lxml / Pillow."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    code = r'''
+import importlib.abc, sys
+class Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in ("lxml", "PIL"):
+            raise ImportError("DLL load failed: An Application Control policy has blocked this file.")
+sys.meta_path.insert(0, Block())
+import run  # noqa: F401  (imports the whole server)
+from server import excel_reader, excel_writer
+from openpyxl import Workbook, load_workbook
+wb = Workbook(); wb.active["A1"] = "x"; wb.save(sys.argv[1])
+excel_reader.read_workbook(sys.argv[1])
+out = excel_writer.apply_edits(open(sys.argv[1], "rb").read(), {"Sheet": {(1, 1): "y"}})
+open(sys.argv[1], "wb").write(out)
+assert load_workbook(sys.argv[1]).active["A1"].value == "y"
+assert not [m for m in sys.modules if m.split(".")[0] in ("lxml", "PIL")]
+print("ok")
+'''
+    root = Path(__file__).resolve().parent.parent
+    res = subprocess.run([sys.executable, "-c", code, str(tmp_path / "t.xlsx")], cwd=root,
+                         capture_output=True, text=True)
+    assert res.stdout.strip() == "ok", res.stderr
+
+
+def test_text_writer_prefixed_namespace_new_rows_and_implicit_cells():
+    ns = excel_writer.NS
+    xml = (f'<?xml version="1.0"?><x:worksheet xmlns:x="{ns}" xmlns:mc="m" mc:Ignorable="x14ac">'
+           '<x:sheetData><x:row r="2" spans="1:2"><x:c><x:v>1</x:v></x:c><x:c t="s"><x:v>0</x:v></x:c></x:row>'
+           '<x:row r="9"><x:c r="A9"><x:v>9</x:v></x:c></x:row></x:sheetData></x:worksheet>').encode()
+    out = excel_writer._patch_sheet(xml, {(2, 3): "new", (5, 1): 5, (12, 2): True}).decode()
+    assert 'mc:Ignorable="x14ac"' in out and "<x:worksheet" in out          # untouched bytes kept
+    assert '<x:row r="2"><x:c r="A2"><x:v>1</x:v></x:c><x:c r="B2" t="s">' in out  # implicit cells addressed
+    assert '<x:c r="C2" t="inlineStr"><x:is><x:t xml:space="preserve">new</x:t>' in out
+    assert out.index('<x:row r="5">') < out.index('<x:row r="9">') < out.index('<x:row r="12">')
+    assert '<x:c r="B12" t="b"><x:v>1</x:v></x:c>' in out
+    import xml.etree.ElementTree as ET
+    ET.fromstring(out.encode())
